@@ -32,6 +32,8 @@
     "lint": "eslint src/* test/* vite.config.ts",
     "size": "size-limit",
     "analyze": "size-limit --why",
+    "gate": "node scripts/release-gate.mjs",
+    "gate:accept": "node scripts/release-gate.mjs --accept",
     "docs": "typedoc --options typedoc.json && markdown-toc -i docs/use.md",
     "docs:fork": "typedoc --options typedoc.json --gitRemote upstream && markdown-toc -i docs/use.md"
   },
@@ -62,12 +64,12 @@
   "module": "./dist/index.js",
   "size-limit": [
     {
-      "path": "dist/reactfire.cjs.production.min.js",
-      "limit": "10 KB"
+      "path": "dist/index.js",
+      "limit": "18 KB"
     },
     {
-      "path": "dist/reactfire.esm.js",
-      "limit": "10 KB"
+      "path": "dist/index.umd.cjs",
+      "limit": "16 KB"
     }
   ],
   "devDependencies": {
