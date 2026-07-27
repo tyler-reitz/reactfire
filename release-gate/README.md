@@ -30,11 +30,27 @@ are caught by this gate (verified by running it against the published 4.2.4 and
 
 | Check | What it catches |
 | --- | --- |
-| `no-cjs-in-esm` | A CJS module inlined into the ESM entry, i.e. the #759 crash. Matches the bare `require` identifier, since the output is minified and the shipped 4.2.5 bundle never literally wrote `require(`. |
+| `no-cjs-in-esm` | A CJS module inlined into **any** ESM chunk, i.e. the #759 crash. Matches the bare `require` identifier, since the output is minified and the shipped 4.2.5 bundle never literally wrote `require(`. |
 | `externals` | Externals getting inlined (duplicate React instance, the shim regression) or new dependencies leaking out as runtime imports. |
 | `exports-map` | Any path in `exports` / `main` / `module` / `typings` missing from the tarball. |
-| `types` | Any change to the emitted `.d.ts` versus the accepted baseline, i.e. the #749 class. |
-| `size` | Packed tarball and entry-point gzip size moving more than ±10%, a proxy for accidental inlining or for `files` sweeping something in. |
+| `types` | Any change to the emitted `.d.ts` versus the accepted baseline, i.e. the #749 class. Covers added and removed declaration files as well as changed ones. |
+| `size` | Packed tarball and entry-point gzip size moving more than ±2%. |
+
+### What `size` is and is not
+
+It is a coarse guard against gross packaging changes, for example `files`
+sweeping in something it should not. **It is not a reliable inlining detector**,
+and the table above should not be read as claiming otherwise.
+
+Measured against the real artifacts, the #759 shim inlining moved the ESM entry
+only **+3.1%** gzip (16815 to 17330 B) and the packed tarball **+0.3%**. An
+earlier draft of this gate used a ±10% band, which would have missed that
+entirely. The tolerance is now ±2%: tight enough to see a #759-sized change,
+loose enough to clear the version stamp CI writes into the bundle (measured at
++0.5% on the tarball, +0.2% on the entries).
+
+`no-cjs-in-esm` and `externals` are what actually catch inlining. Treat `size`
+as a backstop.
 
 ## Tests
 

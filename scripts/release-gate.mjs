@@ -42,12 +42,22 @@ const BASELINE_METRICS = path.join(BASELINE_DIR, 'metrics.json');
 // Bare specifiers the ESM build is allowed to leave as runtime imports.
 // Anything else showing up here means a dependency got externalized by accident;
 // anything missing from MUST_BE_EXTERNAL means one got inlined by accident.
-export const ALLOWED_EXTERNALS = ['react', 'react-dom', 'use-sync-external-store/shim', /^firebase(\/.*)?$/, /^@firebase\/.*$/];
+// Subpaths are matched too: switching to the automatic JSX runtime makes the
+// build import `react/jsx-runtime`, which is legitimate and must not be
+// reported as an unexpected external.
+export const ALLOWED_EXTERNALS = [/^react(\/.*)?$/, /^react-dom(\/.*)?$/, 'use-sync-external-store/shim', /^firebase(\/.*)?$/, /^@firebase\/.*$/];
 
 // Regressing either of these is what shipped as 4.2.4/4.2.5: the CJS
 // `use-sync-external-store/shim` got bundled into the ESM output and became a
 // dynamic `require()` that throws in any browser bundle. See #759 / #760.
-export const MUST_BE_EXTERNAL = ['react', 'use-sync-external-store/shim'];
+//
+// Matched as patterns rather than exact strings so that `react/jsx-runtime`
+// counts as react still being external. An exact match would report "react was
+// inlined" the moment the build switched to the automatic JSX runtime.
+export const MUST_BE_EXTERNAL = [
+  { label: 'react', re: /^react(\/.*)?$/ },
+  { label: 'use-sync-external-store/shim', re: /^use-sync-external-store\/shim$/ },
+];
 
 // Patterns that mean a CJS module was inlined into the ESM output.
 //
@@ -66,7 +76,18 @@ export const CJS_MARKERS = [
 ];
 
 // Size tolerance before the gate complains, as a fraction of the baseline.
-export const SIZE_TOLERANCE = 0.1;
+//
+// Deliberately tight. Measured against the real artifacts, the #759 shim
+// inlining moved the ESM entry only +3.1% gzip (16815 -> 17330 B) and the
+// packed tarball +0.3%, so a 10% band would have missed it entirely. Version
+// churn is the noise floor this has to clear: a CI build stamps the version
+// into the bundle, which measured at +0.5% on the tarball and +0.2% on the
+// entries, so 2% leaves room for that and little else.
+//
+// This is a coarse guard against gross packaging changes, not a reliable
+// inlining detector. `no-cjs-in-esm` and `externals` are what actually catch
+// inlining; see release-gate/README.md.
+export const SIZE_TOLERANCE = 0.02;
 
 /** Collects failures and informational notes for one run. */
 export function createReport() {
@@ -237,45 +258,95 @@ function measure(file) {
   return { bytes: bytes.length, gzip: gzipSync(bytes, { level: 9 }).length };
 }
 
+/** Strip a leading "./" so package.json fields and baseline keys agree. */
+export function normalizeRelative(rel) {
+  return rel.replace(/^\.\//, '');
+}
+
+/**
+ * Every ESM file the package ships, relative to the package root.
+ *
+ * Not just the `module` entry. Nothing guarantees the build emits a single
+ * chunk, and a second entry point (src/nextjs, pending #739) or rollup deciding
+ * to split would put code outside the entry where a CJS inline would be
+ * invisible. Chunking is exactly the kind of incidental build-output change
+ * this gate exists to be robust against.
+ */
+export function listEsmFiles(pkgDir, pkg) {
+  const entry = normalizeRelative(pkg.module ?? pkg.exports?.['.']?.import ?? '');
+  if (!entry) return [];
+  const dir = path.dirname(entry);
+  const cjs = pkg.main ? normalizeRelative(pkg.main) : null;
+
+  const walk = (abs, rel) => {
+    if (!fs.existsSync(abs)) return [];
+    const out = [];
+    for (const item of fs.readdirSync(abs, { withFileTypes: true })) {
+      const childRel = rel ? `${rel}/${item.name}` : item.name;
+      if (item.isDirectory()) {
+        out.push(...walk(path.join(abs, item.name), childRel));
+      } else if (/\.(js|mjs)$/.test(item.name) && childRel !== cjs) {
+        out.push(childRel);
+      }
+    }
+    return out;
+  };
+
+  // The entry sorts first so its findings are reported before other chunks'.
+  return walk(path.join(pkgDir, dir), dir).sort((a, b) => (a === entry ? -1 : b === entry ? 1 : a.localeCompare(b)));
+}
+
 // ---------------------------------------------------------------------------
 // Checks
 // ---------------------------------------------------------------------------
 
 export function checkNoCjsInEsm(pkgDir, pkg, report) {
-  const esmRelative = pkg.module ?? pkg.exports?.['.']?.import;
-  const esm = path.join(pkgDir, esmRelative);
-  if (!fs.existsSync(esm)) {
-    report.fail('no-cjs-in-esm', `ESM entry ${esmRelative} is missing from the package`);
+  const files = listEsmFiles(pkgDir, pkg);
+  if (files.length === 0) {
+    const entry = pkg.module ?? pkg.exports?.['.']?.import;
+    report.fail('no-cjs-in-esm', `ESM entry ${entry} is missing from the package`);
     return;
   }
-  const source = fs.readFileSync(esm, 'utf8');
-  for (const { name, count, lines } of findCjsMarkers(source)) {
-    report.fail(
-      'no-cjs-in-esm',
-      `found ${count} occurrence(s) of \`${name}\` in the ESM entry ${esmRelative}`,
-      [
-        ...lines.map((line) => `    ${esmRelative}:${line}`),
-        '',
-        '    A CJS module was inlined into the ESM build. This throws',
-        '    "Calling `require` for ... in an environment that doesn\'t expose',
-        '    the require function" in any browser bundle. Externalize it in',
-        '    vite.config.ts. See #759 / #760.',
-      ].join('\n'),
-    );
+
+  for (const rel of files) {
+    const source = fs.readFileSync(path.join(pkgDir, rel), 'utf8');
+    for (const { name, count, lines } of findCjsMarkers(source)) {
+      report.fail(
+        'no-cjs-in-esm',
+        `found ${count} occurrence(s) of \`${name}\` in ${rel}`,
+        [
+          ...lines.map((line) => `    ${rel}:${line}`),
+          '',
+          '    A CJS module was inlined into the ESM build. This throws',
+          '    "Calling `require` for ... in an environment that doesn\'t expose',
+          '    the require function" in any browser bundle. Externalize it in',
+          '    vite.config.ts. See #759 / #760.',
+        ].join('\n'),
+      );
+    }
   }
 }
 
 export function checkExternals(pkgDir, pkg, report) {
-  const esmRelative = pkg.module ?? pkg.exports?.['.']?.import;
-  const esm = path.join(pkgDir, esmRelative);
-  if (!fs.existsSync(esm)) return; // already reported
-  const imports = collectImports(fs.readFileSync(esm, 'utf8'));
+  const files = listEsmFiles(pkgDir, pkg);
+  if (files.length === 0) return; // already reported
 
-  const unexpected = imports.filter((spec) => !isAllowedExternal(spec));
-  if (unexpected.length > 0) {
+  // Union across every chunk: a split build can import react from a chunk
+  // rather than from the entry, and that is still react staying external.
+  const byFile = new Map();
+  const all = new Set();
+  for (const rel of files) {
+    const imports = collectImports(fs.readFileSync(path.join(pkgDir, rel), 'utf8'));
+    byFile.set(rel, imports);
+    imports.forEach((spec) => all.add(spec));
+  }
+
+  for (const [rel, imports] of byFile) {
+    const unexpected = imports.filter((spec) => !isAllowedExternal(spec));
+    if (unexpected.length === 0) continue;
     report.fail(
       'externals',
-      `unexpected external import(s) in ${esmRelative}: ${unexpected.join(', ')}`,
+      `unexpected external import(s) in ${rel}: ${unexpected.join(', ')}`,
       [
         '    These are imported at runtime but are not declared externals.',
         '    Either bundle them, or add them to ALLOWED_EXTERNALS and make sure',
@@ -284,11 +355,11 @@ export function checkExternals(pkgDir, pkg, report) {
     );
   }
 
-  const inlined = MUST_BE_EXTERNAL.filter((spec) => !imports.includes(spec));
+  const inlined = MUST_BE_EXTERNAL.filter(({ re }) => ![...all].some((spec) => re.test(spec)));
   if (inlined.length > 0) {
     report.fail(
       'externals',
-      `expected external(s) no longer imported by ${esmRelative}: ${inlined.join(', ')}`,
+      `expected external(s) no longer imported by the ESM output: ${inlined.map((m) => m.label).join(', ')}`,
       [
         '    These must stay external. Losing the import means the module was',
         '    inlined, which risks a duplicate React instance or a dynamic',
@@ -297,7 +368,8 @@ export function checkExternals(pkgDir, pkg, report) {
     );
   }
 
-  report.note(`external imports in ${esmRelative}: ${imports.join(', ') || '(none)'}`);
+  report.note(`ESM files checked: ${files.join(', ')}`);
+  report.note(`external imports: ${[...all].sort().join(', ') || '(none)'}`);
 }
 
 export function checkExportsMap(pkgDir, pkg, report) {
@@ -314,7 +386,15 @@ export function checkExportsMap(pkgDir, pkg, report) {
     if (typeof pkg[field] === 'string') referenced.add(pkg[field]);
   }
 
-  const missing = [...referenced].filter((rel) => rel.startsWith('.')).filter((rel) => !fs.existsSync(path.join(pkgDir, rel)));
+  // `module` is written "./dist/index.js" but `main` and `typings` are written
+  // "dist/index.umd.cjs" and "dist/index.d.ts". Filtering on a leading "." (as
+  // this once did) dropped both before they were ever checked, so the two
+  // fields the failure message names were the two it did not look at.
+  const isFileRef = (rel) => rel.startsWith('.') || rel.startsWith('/') || /\.(js|cjs|mjs|json|ts)$/.test(rel);
+  const missing = [...referenced]
+    .filter(isFileRef)
+    .map(normalizeRelative)
+    .filter((rel) => !fs.existsSync(path.join(pkgDir, rel)));
 
   if (missing.length > 0) {
     report.fail(
@@ -380,7 +460,7 @@ export function checkTypes(pkgDir, report, { accept = false, baselineTypes = BAS
 export function checkSize(pkgDir, pkg, tarball, report, { accept = false, baselineMetrics = BASELINE_METRICS } = {}) {
   // `module` is written "./dist/index.js" and `main` "dist/index.umd.cjs";
   // normalize so the baseline keys do not churn if package.json is tidied.
-  const entries = [pkg.module, pkg.main].filter((rel) => typeof rel === 'string').map((rel) => rel.replace(/^\.\//, ''));
+  const entries = [pkg.module, pkg.main].filter((rel) => typeof rel === 'string').map(normalizeRelative);
   const current = {};
   for (const rel of entries) {
     const file = path.join(pkgDir, rel);
@@ -463,6 +543,20 @@ function main() {
   const args = process.argv.slice(2);
   const accept = args.includes('--accept');
   const tarballArg = args.find((a) => !a.startsWith('--'));
+
+  const unknown = args.filter((a) => a.startsWith('--') && a !== '--accept');
+  if (unknown.length > 0) {
+    console.error(`unknown option(s): ${unknown.join(', ')}`);
+    console.error('usage: node scripts/release-gate.mjs [tarball] | --accept');
+    return 2;
+  }
+  // Recording a baseline from an arbitrary tarball would silently bless
+  // whatever that build contained, including a regression.
+  if (accept && tarballArg) {
+    console.error('--accept records the baseline from the current build and takes no tarball argument.');
+    console.error('Build first (`npx tsc && npx vite build`), then run `npm run gate:accept`.');
+    return 2;
+  }
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'reactfire-gate-'));
   try {

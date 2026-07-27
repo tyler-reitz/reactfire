@@ -2,7 +2,7 @@ import { gzipSync } from 'node:zlib';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { collectImports, findCjsMarkers, listTypeFiles, diffLines, isAllowedExternal, runChecks } from '../scripts/release-gate.mjs';
+import { collectImports, findCjsMarkers, listTypeFiles, listEsmFiles, diffLines, isAllowedExternal, runChecks } from '../scripts/release-gate.mjs';
 
 /**
  * The release gate exists to catch dist-level regressions that shipped as patch
@@ -70,6 +70,13 @@ describe('isAllowedExternal', () => {
   it('rejects anything else', () => {
     for (const spec of ['rxjs', 'rxfire/firestore', 'lodash']) {
       expect(isAllowedExternal(spec)).toBe(false);
+    }
+  });
+
+  // The automatic JSX runtime imports react/jsx-runtime, which is legitimate.
+  it('allows react and react-dom subpaths', () => {
+    for (const spec of ['react/jsx-runtime', 'react/jsx-dev-runtime', 'react-dom/client']) {
+      expect(isAllowedExternal(spec)).toBe(true);
     }
   });
 });
@@ -143,11 +150,16 @@ describe('diffLines', () => {
 describe('runChecks', () => {
   let dir;
 
-  const build = ({ esm, types = { 'index.d.ts': 'export declare const a: string;\n' } }) => {
+  const build = ({ esm, types = { 'index.d.ts': 'export declare const a: string;\n' }, extraDist = {} }) => {
     const pkgDir = path.join(dir, 'package');
     fs.mkdirSync(path.join(pkgDir, 'dist'), { recursive: true });
     fs.writeFileSync(path.join(pkgDir, 'dist', 'index.js'), esm);
     fs.writeFileSync(path.join(pkgDir, 'dist', 'index.umd.cjs'), 'module.exports = {};');
+    for (const [file, contents] of Object.entries(extraDist)) {
+      const dest = path.join(pkgDir, 'dist', file);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, contents);
+    }
     for (const [file, contents] of Object.entries(types)) {
       fs.writeFileSync(path.join(pkgDir, 'dist', file), contents);
     }
@@ -236,5 +248,163 @@ describe('runChecks', () => {
     fs.rmSync(path.join(pkgDir, 'dist', 'index.umd.cjs'));
     const { failures } = runChecks(pkgDir, pkg, tarball, options);
     expect(failures.find((f) => f.check === 'exports-map')?.message).toContain('dist/index.umd.cjs');
+  });
+
+  // Regression: `main` and `typings` are written without a "./" prefix, and the
+  // check used to filter on a leading ".", so the two fields its own failure
+  // message named were the two it never looked at.
+  it('fails when typings is missing, even though it has no "./" prefix', () => {
+    const { pkgDir, pkg, tarball, options } = build({ esm: ESM_CLEAN });
+    fs.rmSync(path.join(pkgDir, 'dist', 'index.d.ts'));
+    fs.rmSync(path.join(options.baselineTypes, 'index.d.ts'));
+    const { failures } = runChecks(pkgDir, pkg, tarball, options);
+    expect(failures.find((f) => f.check === 'exports-map')?.message).toContain('dist/index.d.ts');
+  });
+
+  it('fails when main is missing and no exports map duplicates it', () => {
+    const { pkgDir, pkg, tarball, options } = build({ esm: ESM_CLEAN });
+    delete pkg.exports;
+    fs.rmSync(path.join(pkgDir, 'dist', 'index.umd.cjs'));
+    const { failures } = runChecks(pkgDir, pkg, tarball, options);
+    expect(failures.find((f) => f.check === 'exports-map')?.message).toContain('dist/index.umd.cjs');
+  });
+
+  it('does not treat bare package specifiers as missing files', () => {
+    const { pkgDir, pkg, tarball, options } = build({ esm: ESM_CLEAN });
+    pkg.exports['./polyfill'] = { import: 'react' };
+    const { failures } = runChecks(pkgDir, pkg, tarball, options);
+    expect(failures.find((f) => f.check === 'exports-map')).toBeUndefined();
+  });
+
+  // The #739 case: a new entry point emits a new declaration file. The
+  // recursion that finds it is only useful if a new file actually fails.
+  it('fails when a declaration file is added', () => {
+    const { pkgDir, pkg, tarball, options } = build({ esm: ESM_CLEAN });
+    fs.mkdirSync(path.join(pkgDir, 'dist', 'nextjs'), { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'dist', 'nextjs', 'middleware.d.ts'), 'export declare const mw: string;\n');
+    const { failures } = runChecks(pkgDir, pkg, tarball, options);
+    const types = failures.find((f) => f.check === 'types');
+    expect(types?.message).toContain('1 added');
+    expect(types?.detail).toContain('nextjs/middleware.d.ts');
+  });
+
+  it('fails when a declaration file is removed', () => {
+    const { pkgDir, pkg, tarball, options } = build({ esm: ESM_CLEAN });
+    fs.writeFileSync(path.join(options.baselineTypes, 'storage.d.ts'), 'export declare const s: string;\n');
+    const { failures } = runChecks(pkgDir, pkg, tarball, options);
+    const types = failures.find((f) => f.check === 'types');
+    expect(types?.message).toContain('1 removed');
+    expect(types?.detail).toContain('storage.d.ts');
+  });
+
+  // A CJS inline in a non-entry chunk was previously invisible: both bundle
+  // checks only ever opened pkg.module.
+  it('detects inlined CJS in a non-entry chunk', () => {
+    const { pkgDir, pkg, tarball, options } = build({
+      esm: `${ESM_CLEAN}\nimport "./chunk-abc.js";`,
+      extraDist: { 'chunk-abc.js': ESM_WITH_INLINED_CJS },
+    });
+    const { failures } = runChecks(pkgDir, pkg, tarball, options);
+    const cjs = failures.find((f) => f.check === 'no-cjs-in-esm');
+    expect(cjs?.message).toContain('chunk-abc.js');
+  });
+
+  it('accepts an expected external imported from a chunk rather than the entry', () => {
+    const { pkgDir, pkg, tarball, options } = build({
+      esm: 'import * as e from "react";\nimport "./chunk-abc.js";\nexport { e };',
+      extraDist: { 'chunk-abc.js': 'import { useSyncExternalStore as m } from "use-sync-external-store/shim";\nexport { m };' },
+    });
+    const { failures } = runChecks(pkgDir, pkg, tarball, options);
+    expect(failures.find((f) => f.check === 'externals')).toBeUndefined();
+  });
+
+  it('does not scan the UMD build for CJS markers', () => {
+    const { pkgDir, pkg, tarball, options } = build({ esm: ESM_CLEAN });
+    fs.writeFileSync(path.join(pkgDir, 'dist', 'index.umd.cjs'), 'var x = require("react");');
+    const { failures } = runChecks(pkgDir, pkg, tarball, options);
+    expect(failures.find((f) => f.check === 'no-cjs-in-esm')).toBeUndefined();
+  });
+
+  it('treats react/jsx-runtime as react staying external', () => {
+    const { pkgDir, pkg, tarball, options } = build({
+      esm: 'import { jsx } from "react/jsx-runtime";\nimport { useSyncExternalStore as m } from "use-sync-external-store/shim";\nexport { jsx, m };',
+    });
+    const { failures } = runChecks(pkgDir, pkg, tarball, options);
+    expect(failures.find((f) => f.check === 'externals')).toBeUndefined();
+  });
+
+  // The size check had no coverage at all: deleting it, or setting the
+  // tolerance to 100, left every test green.
+  it('fails when an entry point grows beyond the tolerance', () => {
+    const { pkgDir, pkg, tarball, options } = build({ esm: ESM_CLEAN });
+    const metrics = JSON.parse(fs.readFileSync(options.baselineMetrics, 'utf8'));
+    metrics.sizes['dist/index.js'].gzip = Math.round(metrics.sizes['dist/index.js'].gzip / 1.5);
+    fs.writeFileSync(options.baselineMetrics, JSON.stringify(metrics));
+    const { failures } = runChecks(pkgDir, pkg, tarball, options);
+    expect(failures.find((f) => f.check === 'size')?.message).toContain('dist/index.js');
+  });
+
+  it('fails when the packed tarball grows beyond the tolerance', () => {
+    const { pkgDir, pkg, tarball, options } = build({ esm: ESM_CLEAN });
+    const metrics = JSON.parse(fs.readFileSync(options.baselineMetrics, 'utf8'));
+    metrics.packed = 10;
+    fs.writeFileSync(options.baselineMetrics, JSON.stringify(metrics));
+    const { failures } = runChecks(pkgDir, pkg, tarball, options);
+    expect(failures.find((f) => f.check === 'size')?.message).toContain('packed tarball');
+  });
+
+  // The band has to sit below the movement the #759 inlining actually produced
+  // (+3.1% on the ESM entry) and above CI's version-stamp churn (~+0.5%).
+  // A 10% tolerance, which is what this shipped with first, misses this.
+  it('fails on a delta the size of the #759 inlining', () => {
+    const { pkgDir, pkg, tarball, options } = build({ esm: ESM_CLEAN });
+    const metrics = JSON.parse(fs.readFileSync(options.baselineMetrics, 'utf8'));
+    metrics.sizes['dist/index.js'].gzip = Math.round(metrics.sizes['dist/index.js'].gzip / 1.031);
+    fs.writeFileSync(options.baselineMetrics, JSON.stringify(metrics));
+    const { failures } = runChecks(pkgDir, pkg, tarball, options);
+    expect(failures.find((f) => f.check === 'size')?.message).toContain('dist/index.js');
+  });
+
+  it('tolerates size movement within the tolerance', () => {
+    const { pkgDir, pkg, tarball, options } = build({ esm: ESM_CLEAN });
+    const metrics = JSON.parse(fs.readFileSync(options.baselineMetrics, 'utf8'));
+    metrics.sizes['dist/index.js'].gzip = Math.round(metrics.sizes['dist/index.js'].gzip / 1.01);
+    fs.writeFileSync(options.baselineMetrics, JSON.stringify(metrics));
+    const { failures } = runChecks(pkgDir, pkg, tarball, options);
+    expect(failures.find((f) => f.check === 'size')).toBeUndefined();
+  });
+});
+
+describe('listEsmFiles', () => {
+  let dir;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-esm-'));
+    fs.mkdirSync(path.join(dir, 'dist'), { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const pkg = { module: './dist/index.js', main: 'dist/index.umd.cjs' };
+
+  it('lists every ESM chunk with the entry first, excluding the UMD build', () => {
+    for (const f of ['index.js', 'chunk-b.js', 'chunk-a.mjs', 'index.umd.cjs', 'index.js.map']) {
+      fs.writeFileSync(path.join(dir, 'dist', f), '');
+    }
+    expect(listEsmFiles(dir, pkg)).toEqual(['dist/index.js', 'dist/chunk-a.mjs', 'dist/chunk-b.js']);
+  });
+
+  it('recurses into nested chunk directories', () => {
+    fs.mkdirSync(path.join(dir, 'dist', 'nextjs'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'dist', 'index.js'), '');
+    fs.writeFileSync(path.join(dir, 'dist', 'nextjs', 'middleware.js'), '');
+    expect(listEsmFiles(dir, pkg)).toEqual(['dist/index.js', 'dist/nextjs/middleware.js']);
+  });
+
+  it('returns nothing when the dist directory is absent', () => {
+    fs.rmSync(path.join(dir, 'dist'), { recursive: true });
+    expect(listEsmFiles(dir, pkg)).toEqual([]);
   });
 });
