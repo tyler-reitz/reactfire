@@ -36,6 +36,19 @@ are caught by this gate (verified by running it against the published 4.2.4 and
 | `types` | Any change to the emitted `.d.ts` versus the accepted baseline, i.e. the #749 class. |
 | `size` | Packed tarball and entry-point gzip size moving more than ±10%, a proxy for accidental inlining or for `files` sweeping something in. |
 
+## Tests
+
+The detection logic is pinned by `test/release-gate.test.mjs`:
+
+```sh
+npm run test:gate      # no emulators needed
+```
+
+A gate that silently stops gating is worse than no gate, so the checks are
+covered by tests rather than by having been verified by hand once. The fixtures
+are byte-faithful to the shapes that actually shipped, including the 4.2.5
+`require` shim.
+
 ## Running it
 
 ```sh

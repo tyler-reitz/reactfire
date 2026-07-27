@@ -21,9 +21,14 @@
  * size delta as a reviewable diff in the pull request, which is what #749 asks
  * for: a non-additive type change cannot land without someone acknowledging it
  * and making the semver call.
+ *
+ * The exported helpers below are covered by test/release-gate.test.mjs. A gate
+ * that silently stops gating is worse than no gate, so the detection logic is
+ * pinned by tests rather than by having been checked by hand once.
  */
 
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -37,12 +42,12 @@ const BASELINE_METRICS = path.join(BASELINE_DIR, 'metrics.json');
 // Bare specifiers the ESM build is allowed to leave as runtime imports.
 // Anything else showing up here means a dependency got externalized by accident;
 // anything missing from MUST_BE_EXTERNAL means one got inlined by accident.
-const ALLOWED_EXTERNALS = ['react', 'react-dom', 'use-sync-external-store/shim', /^firebase(\/.*)?$/, /^@firebase\/.*$/];
+export const ALLOWED_EXTERNALS = ['react', 'react-dom', 'use-sync-external-store/shim', /^firebase(\/.*)?$/, /^@firebase\/.*$/];
 
 // Regressing either of these is what shipped as 4.2.4/4.2.5: the CJS
 // `use-sync-external-store/shim` got bundled into the ESM output and became a
 // dynamic `require()` that throws in any browser bundle. See #759 / #760.
-const MUST_BE_EXTERNAL = ['react', 'use-sync-external-store/shim'];
+export const MUST_BE_EXTERNAL = ['react', 'use-sync-external-store/shim'];
 
 // Patterns that mean a CJS module was inlined into the ESM output.
 //
@@ -51,7 +56,7 @@ const MUST_BE_EXTERNAL = ['react', 'use-sync-external-store/shim'];
 // guards and `require.apply(this, arguments)`. For the same reason the helper
 // names below are only useful on unminified output, since minification renames
 // `__commonJS` to a single letter. The identifier check is the load-bearing one.
-const CJS_MARKERS = [
+export const CJS_MARKERS = [
   { name: 'require', re: /(^|[^.\w$])require\b/g },
   { name: 'createRequire', re: /createRequire\b/g },
   { name: '__commonJS', re: /__commonJS\b/g },
@@ -61,13 +66,18 @@ const CJS_MARKERS = [
 ];
 
 // Size tolerance before the gate complains, as a fraction of the baseline.
-const SIZE_TOLERANCE = 0.1;
+export const SIZE_TOLERANCE = 0.1;
 
-const failures = [];
-const notes = [];
-
-function fail(check, message, detail) {
-  failures.push({ check, message, detail });
+/** Collects failures and informational notes for one run. */
+export function createReport() {
+  const failures = [];
+  const notes = [];
+  return {
+    failures,
+    notes,
+    fail: (check, message, detail) => failures.push({ check, message, detail }),
+    note: (message) => notes.push(message),
+  };
 }
 
 function readPackageJson(dir) {
@@ -123,14 +133,28 @@ function extract(tarball, outDir) {
 
 /**
  * Collect the bare module specifiers an ESM bundle imports at runtime.
- * Covers static import/export-from and dynamic import().
+ * Covers static import, export-from, star re-export and dynamic import().
+ *
+ * The keyword may be followed by whitespace, `{`, `*` or a quote, because
+ * minified output writes `import{a}from"react"` and `export*from"rxjs"` with no
+ * space. Requiring whitespace here silently blinded the externals check on any
+ * minified build, which is the same class of build-output change that caused
+ * #759 in the first place.
  */
-function collectImports(source) {
+export function collectImports(source) {
   const specifiers = new Set();
-  const patterns = [/\b(?:import|export)\s[\s\S]*?\bfrom\s*["']([^"']+)["']/g, /\bimport\s*["']([^"']+)["']/g, /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g];
+  const patterns = [
+    // import ... from "x" / export ... from "x" / export * from "x"
+    /\b(?:import|export)[\s{*]([\s\S]*?)\bfrom\s*["']([^"']+)["']/g,
+    // bare side-effect import: import"x"
+    /\bimport\s*["']([^"']+)["']/g,
+    // dynamic import("x")
+    /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
+  ];
   for (const re of patterns) {
     for (const match of source.matchAll(re)) {
-      const spec = match[1];
+      // The first pattern captures the clause too; the specifier is always last.
+      const spec = match[match.length - 1];
       // Relative and absolute specifiers resolve inside the package.
       if (spec.startsWith('.') || spec.startsWith('/')) continue;
       specifiers.add(spec);
@@ -139,12 +163,27 @@ function collectImports(source) {
   return [...specifiers].sort();
 }
 
-function isAllowedExternal(spec) {
+export function isAllowedExternal(spec) {
   return ALLOWED_EXTERNALS.some((rule) => (typeof rule === 'string' ? rule === spec : rule.test(spec)));
 }
 
+/** Find CJS-interop markers in an ESM bundle. Returns one entry per marker hit. */
+export function findCjsMarkers(source) {
+  const found = [];
+  for (const { name, re } of CJS_MARKERS) {
+    const hits = [...source.matchAll(re)];
+    if (hits.length === 0) continue;
+    found.push({
+      name,
+      count: hits.length,
+      lines: hits.slice(0, 5).map((hit) => source.slice(0, hit.index).split('\n').length),
+    });
+  }
+  return found;
+}
+
 /** Minimal unified-ish diff so a type change is readable in CI logs. */
-function diffLines(before, after) {
+export function diffLines(before, after) {
   const a = before.split('\n');
   const b = after.split('\n');
   // LCS table. The .d.ts files are small (hundreds of lines), so this is fine.
@@ -172,12 +211,25 @@ function diffLines(before, after) {
   return out.join('\n');
 }
 
-function listTypeFiles(dir) {
+/**
+ * List declaration files under `dir`, recursively, as paths relative to `dir`.
+ *
+ * Recursive because tsconfig emits with `rootDir: ./src`, so a subdirectory of
+ * src/ (src/nextjs, pending #739) emits dist/nextjs/*.d.ts. A flat listing would
+ * leave that entire type surface silently outside the #749 check.
+ */
+export function listTypeFiles(dir, prefix = '') {
   if (!fs.existsSync(dir)) return [];
-  return fs
-    .readdirSync(dir)
-    .filter((f) => f.endsWith('.d.ts'))
-    .sort();
+  const out = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      out.push(...listTypeFiles(path.join(dir, entry.name), rel));
+    } else if (entry.name.endsWith('.d.ts')) {
+      out.push(rel);
+    }
+  }
+  return out.sort();
 }
 
 function measure(file) {
@@ -189,26 +241,20 @@ function measure(file) {
 // Checks
 // ---------------------------------------------------------------------------
 
-function checkNoCjsInEsm(pkgDir, pkg) {
+export function checkNoCjsInEsm(pkgDir, pkg, report) {
   const esmRelative = pkg.module ?? pkg.exports?.['.']?.import;
   const esm = path.join(pkgDir, esmRelative);
   if (!fs.existsSync(esm)) {
-    fail('no-cjs-in-esm', `ESM entry ${esmRelative} is missing from the package`);
+    report.fail('no-cjs-in-esm', `ESM entry ${esmRelative} is missing from the package`);
     return;
   }
   const source = fs.readFileSync(esm, 'utf8');
-  for (const { name, re } of CJS_MARKERS) {
-    const hits = [...source.matchAll(re)];
-    if (hits.length === 0) continue;
-    const lines = hits.slice(0, 5).map((hit) => {
-      const line = source.slice(0, hit.index).split('\n').length;
-      return `    ${esmRelative}:${line}`;
-    });
-    fail(
+  for (const { name, count, lines } of findCjsMarkers(source)) {
+    report.fail(
       'no-cjs-in-esm',
-      `found ${hits.length} occurrence(s) of \`${name}\` in the ESM entry ${esmRelative}`,
+      `found ${count} occurrence(s) of \`${name}\` in the ESM entry ${esmRelative}`,
       [
-        ...lines,
+        ...lines.map((line) => `    ${esmRelative}:${line}`),
         '',
         '    A CJS module was inlined into the ESM build. This throws',
         '    "Calling `require` for ... in an environment that doesn\'t expose',
@@ -219,7 +265,7 @@ function checkNoCjsInEsm(pkgDir, pkg) {
   }
 }
 
-function checkExternals(pkgDir, pkg) {
+export function checkExternals(pkgDir, pkg, report) {
   const esmRelative = pkg.module ?? pkg.exports?.['.']?.import;
   const esm = path.join(pkgDir, esmRelative);
   if (!fs.existsSync(esm)) return; // already reported
@@ -227,7 +273,7 @@ function checkExternals(pkgDir, pkg) {
 
   const unexpected = imports.filter((spec) => !isAllowedExternal(spec));
   if (unexpected.length > 0) {
-    fail(
+    report.fail(
       'externals',
       `unexpected external import(s) in ${esmRelative}: ${unexpected.join(', ')}`,
       [
@@ -240,7 +286,7 @@ function checkExternals(pkgDir, pkg) {
 
   const inlined = MUST_BE_EXTERNAL.filter((spec) => !imports.includes(spec));
   if (inlined.length > 0) {
-    fail(
+    report.fail(
       'externals',
       `expected external(s) no longer imported by ${esmRelative}: ${inlined.join(', ')}`,
       [
@@ -251,10 +297,10 @@ function checkExternals(pkgDir, pkg) {
     );
   }
 
-  notes.push(`external imports in ${esmRelative}: ${imports.join(', ') || '(none)'}`);
+  report.note(`external imports in ${esmRelative}: ${imports.join(', ') || '(none)'}`);
 }
 
-function checkExportsMap(pkgDir, pkg) {
+export function checkExportsMap(pkgDir, pkg, report) {
   const referenced = new Set();
   const walk = (node) => {
     if (typeof node === 'string') {
@@ -271,7 +317,7 @@ function checkExportsMap(pkgDir, pkg) {
   const missing = [...referenced].filter((rel) => rel.startsWith('.')).filter((rel) => !fs.existsSync(path.join(pkgDir, rel)));
 
   if (missing.length > 0) {
-    fail(
+    report.fail(
       'exports-map',
       `path(s) referenced by package.json are not in the tarball: ${missing.join(', ')}`,
       ['    The `files` allowlist or the build output and the exports map have', '    drifted apart. Consumers will fail to resolve these.'].join('\n'),
@@ -279,23 +325,24 @@ function checkExportsMap(pkgDir, pkg) {
   }
 }
 
-function checkTypes(pkgDir, { accept }) {
+export function checkTypes(pkgDir, report, { accept = false, baselineTypes = BASELINE_TYPES } = {}) {
   const distTypes = path.join(pkgDir, 'dist');
   const current = listTypeFiles(distTypes);
 
   if (accept) {
-    fs.rmSync(BASELINE_TYPES, { recursive: true, force: true });
-    fs.mkdirSync(BASELINE_TYPES, { recursive: true });
+    fs.rmSync(baselineTypes, { recursive: true, force: true });
     for (const file of current) {
-      fs.copyFileSync(path.join(distTypes, file), path.join(BASELINE_TYPES, file));
+      const dest = path.join(baselineTypes, file);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(path.join(distTypes, file), dest);
     }
     console.log(`recorded ${current.length} type file(s) to release-gate/baseline/types/`);
     return;
   }
 
-  const baseline = listTypeFiles(BASELINE_TYPES);
+  const baseline = listTypeFiles(baselineTypes);
   if (baseline.length === 0) {
-    fail('types', 'no accepted type baseline found', ['    Run `npm run gate:accept` to record one, and commit the result.'].join('\n'));
+    report.fail('types', 'no accepted type baseline found', '    Run `npm run gate:accept` to record one, and commit the result.');
     return;
   }
 
@@ -303,7 +350,7 @@ function checkTypes(pkgDir, { accept }) {
   const removed = baseline.filter((f) => !current.includes(f));
   const changed = [];
   for (const file of current.filter((f) => baseline.includes(f))) {
-    const before = fs.readFileSync(path.join(BASELINE_TYPES, file), 'utf8');
+    const before = fs.readFileSync(path.join(baselineTypes, file), 'utf8');
     const after = fs.readFileSync(path.join(distTypes, file), 'utf8');
     if (before !== after) changed.push({ file, diff: diffLines(before, after) });
   }
@@ -323,14 +370,14 @@ function checkTypes(pkgDir, { accept }) {
     '    changelog note), then run `npm run gate:accept` and commit the',
     '    updated baseline in the same pull request. See #749.',
   );
-  fail(
+  report.fail(
     'types',
     `emitted .d.ts differ from the accepted baseline (${changed.length} changed, ${added.length} added, ${removed.length} removed)`,
     detail.join('\n'),
   );
 }
 
-function checkSize(pkgDir, pkg, tarball, { accept }) {
+export function checkSize(pkgDir, pkg, tarball, report, { accept = false, baselineMetrics = BASELINE_METRICS } = {}) {
   // `module` is written "./dist/index.js" and `main` "dist/index.umd.cjs";
   // normalize so the baseline keys do not churn if package.json is tidied.
   const entries = [pkg.module, pkg.main].filter((rel) => typeof rel === 'string').map((rel) => rel.replace(/^\.\//, ''));
@@ -342,18 +389,18 @@ function checkSize(pkgDir, pkg, tarball, { accept }) {
   const packed = fs.statSync(tarball).size;
 
   if (accept) {
-    fs.mkdirSync(BASELINE_DIR, { recursive: true });
-    fs.writeFileSync(BASELINE_METRICS, `${JSON.stringify({ packed, sizes: current }, null, 2)}\n`);
+    fs.mkdirSync(path.dirname(baselineMetrics), { recursive: true });
+    fs.writeFileSync(baselineMetrics, `${JSON.stringify({ packed, sizes: current }, null, 2)}\n`);
     console.log(`recorded bundle sizes to release-gate/baseline/metrics.json`);
     return;
   }
 
-  if (!fs.existsSync(BASELINE_METRICS)) {
-    fail('size', 'no accepted size baseline found', '    Run `npm run gate:accept` to record one, and commit the result.');
+  if (!fs.existsSync(baselineMetrics)) {
+    report.fail('size', 'no accepted size baseline found', '    Run `npm run gate:accept` to record one, and commit the result.');
     return;
   }
 
-  const recorded = JSON.parse(fs.readFileSync(BASELINE_METRICS, 'utf8'));
+  const recorded = JSON.parse(fs.readFileSync(baselineMetrics, 'utf8'));
 
   // Guards the whole tarball, not just the entry points. `files` includes
   // `src`, so anything that lands under src/ ships to npm, including a nested
@@ -361,9 +408,9 @@ function checkSize(pkgDir, pkg, tarball, { accept }) {
   if (typeof recorded.packed === 'number') {
     const delta = (packed - recorded.packed) / recorded.packed;
     const pct = `${delta >= 0 ? '+' : ''}${(delta * 100).toFixed(1)}%`;
-    notes.push(`tarball: ${packed} B (${pct} vs baseline ${recorded.packed} B)`);
+    report.note(`tarball: ${packed} B (${pct} vs baseline ${recorded.packed} B)`);
     if (Math.abs(delta) > SIZE_TOLERANCE) {
-      fail(
+      report.fail(
         'size',
         `packed tarball size moved ${pct} (${recorded.packed} B -> ${packed} B), tolerance is ±${SIZE_TOLERANCE * 100}%`,
         [
@@ -379,14 +426,14 @@ function checkSize(pkgDir, pkg, tarball, { accept }) {
   for (const [rel, now] of Object.entries(current)) {
     const before = baseline[rel];
     if (!before) {
-      fail('size', `no size baseline for ${rel}`, '    Run `npm run gate:accept` and commit the result.');
+      report.fail('size', `no size baseline for ${rel}`, '    Run `npm run gate:accept` and commit the result.');
       continue;
     }
     const delta = (now.gzip - before.gzip) / before.gzip;
     const pct = `${delta >= 0 ? '+' : ''}${(delta * 100).toFixed(1)}%`;
-    notes.push(`${rel}: ${now.gzip} B gzip (${pct} vs baseline ${before.gzip} B)`);
+    report.note(`${rel}: ${now.gzip} B gzip (${pct} vs baseline ${before.gzip} B)`);
     if (Math.abs(delta) > SIZE_TOLERANCE) {
-      fail(
+      report.fail(
         'size',
         `${rel} gzip size moved ${pct} (${before.gzip} B -> ${now.gzip} B), tolerance is ±${SIZE_TOLERANCE * 100}%`,
         [
@@ -397,6 +444,17 @@ function checkSize(pkgDir, pkg, tarball, { accept }) {
       );
     }
   }
+}
+
+/** Run every read-only check against an extracted package directory. */
+export function runChecks(pkgDir, pkg, tarball, options = {}) {
+  const report = createReport();
+  checkNoCjsInEsm(pkgDir, pkg, report);
+  checkExternals(pkgDir, pkg, report);
+  checkExportsMap(pkgDir, pkg, report);
+  checkTypes(pkgDir, report, options);
+  checkSize(pkgDir, pkg, tarball, report, options);
+  return report;
 }
 
 // ---------------------------------------------------------------------------
@@ -415,17 +473,14 @@ function main() {
     console.log(`release gate: reactfire@${pkg.version} (${path.basename(tarball)})\n`);
 
     if (accept) {
-      checkTypes(pkgDir, { accept });
-      checkSize(pkgDir, pkg, tarball, { accept });
+      const report = createReport();
+      checkTypes(pkgDir, report, { accept });
+      checkSize(pkgDir, pkg, tarball, report, { accept });
       console.log('\nbaseline updated. Review the diff and commit it.');
       return 0;
     }
 
-    checkNoCjsInEsm(pkgDir, pkg);
-    checkExternals(pkgDir, pkg);
-    checkExportsMap(pkgDir, pkg);
-    checkTypes(pkgDir, { accept });
-    checkSize(pkgDir, pkg, tarball, { accept });
+    const { failures, notes } = runChecks(pkgDir, pkg, tarball);
 
     for (const note of notes) console.log(`  ${note}`);
 
@@ -446,4 +501,7 @@ function main() {
   }
 }
 
-process.exit(main());
+// Only run when invoked directly, so tests can import the helpers above.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.exit(main());
+}
