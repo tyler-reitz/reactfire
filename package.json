@@ -29,11 +29,13 @@
     "test:useObservable": "vitest useObservable",
     "test:firebaseApp": "vitest firebaseApp",
     "test:gate": "vitest release-gate",
+    "test:loads": "vitest entry-load",
     "format": "prettier src test scripts vite.config.ts -w",
     "lint": "eslint src/* test/* scripts/* vite.config.ts",
     "size": "size-limit",
     "analyze": "size-limit --why",
     "gate": "node scripts/release-gate.mjs",
+    "loads": "node scripts/entry-load.mjs",
     "gate:accept": "node scripts/release-gate.mjs --accept",
     "docs": "typedoc --options typedoc.json && markdown-toc -i docs/use.md",
     "docs:fork": "typedoc --options typedoc.json --gitRemote upstream && markdown-toc -i docs/use.md"
