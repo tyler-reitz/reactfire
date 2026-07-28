@@ -17,6 +17,7 @@
  *    another failing one, so the rest are reported as consequences.
  */
 
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
 import ts from 'typescript';
@@ -47,8 +48,8 @@ function resolveAlias(checker, symbol) {
   return symbol && symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
 }
 
-function readExports(entry) {
-  const program = ts.createProgram([entry], COMPILER_OPTIONS);
+function readExports(entry, compilerOptions = COMPILER_OPTIONS) {
+  const program = ts.createProgram([entry], compilerOptions);
   const checker = program.getTypeChecker();
   const source = program.getSourceFile(entry);
   const moduleSymbol = checker.getSymbolAtLocation(source);
@@ -216,9 +217,23 @@ function attribute(failures, exports) {
   return { roots, derived, cyclic: false };
 }
 
-function main() {
-  const { exports: oldExports } = readExports(OLD);
-  const { exports: newExports, program: newProgram } = readExports(NEW);
+/**
+ * Compare two extracted packages and classify the change.
+ *
+ * `oldDir` and `newDir` each contain an `index.d.ts`. Run
+ * `stripPrivateMembers` over both first, or classes with private members will
+ * compare as breaking against themselves.
+ *
+ * Writes a probe file into `newDir`, so pass copies rather than anything you
+ * mind being written to.
+ */
+export function compare(oldDir, newDir, options = {}) {
+  const OLD = path.join(path.resolve(oldDir), 'index.d.ts');
+  const NEW = path.join(path.resolve(newDir), 'index.d.ts');
+  const compilerOptions = { ...COMPILER_OPTIONS, baseUrl: options.baseUrl ?? path.resolve(newDir) };
+
+  const { exports: oldExports } = readExports(OLD, compilerOptions);
+  const { exports: newExports, program: newProgram } = readExports(NEW, compilerOptions);
   const removed = [...oldExports.keys()].filter((k) => !newExports.has(k));
   const added = [...newExports.keys()].filter((k) => !oldExports.has(k));
   const shared = [...newExports.values()].filter((e) => oldExports.has(e.name));
@@ -232,7 +247,7 @@ function main() {
   const probePath = path.join(newDist, '__probe.ts');
   fs.writeFileSync(probePath, source);
 
-  const program = ts.createProgram([probePath], COMPILER_OPTIONS);
+  const program = ts.createProgram([probePath], compilerOptions);
   const diagnostics = ts.getPreEmitDiagnostics(program).filter((d) => d.file && path.resolve(d.file.fileName) === probePath);
 
   const failures = new Map();
@@ -268,20 +283,39 @@ function main() {
 
   const { roots, derived, cyclic } = attribute(breakingFailures, newExports);
 
-  console.log(`exports: ${oldExports.size} -> ${newExports.size}`);
+  const verdict = removed.length > 0 || breakingFailures.size > 0 ? 'BREAKING' : added.length > 0 || permissive.length > 0 ? 'ADDITIVE' : 'NO CHANGE';
+
+  return {
+    verdict,
+    removed,
+    added,
+    permissive,
+    roots,
+    derived,
+    cyclic,
+    breakingCount: breakingFailures.size,
+    exportNames: { old: [...oldExports.keys()], new: [...newExports.keys()] },
+  };
+}
+
+function report(result) {
+  const { verdict, removed, added, permissive, roots, derived, cyclic, breakingCount, exportNames } = result;
+  console.log(`exports: ${exportNames.old.length} -> ${exportNames.new.length}`);
   if (removed.length) console.log(`REMOVED (always breaking): ${removed.join(', ')}`);
   if (added.length) console.log(`added (additive): ${added.join(', ')}`);
   if (permissive.length) console.log(`\npermissive (more accepting; existing code still compiles): ${permissive.join(', ')}`);
-  console.log(`\nbreaking symbols: ${breakingFailures.size}${cyclic ? '  (cyclic, no independent root)' : ''}`);
+  console.log(`\nbreaking symbols: ${breakingCount}${cyclic ? '  (cyclic, no independent root)' : ''}`);
   console.log(`root causes: ${roots.length}`);
   for (const name of roots) console.log(`  * ${name}`);
   console.log(`derived (consequences of the above): ${derived.length}`);
   for (const { name, via } of derived.slice(0, 4)) console.log(`  - ${name} via ${via.join(', ')}`);
   if (derived.length > 4) console.log(`  ... and ${derived.length - 4} more`);
 
-  const isBreaking = removed.length > 0 || breakingFailures.size > 0;
-  const isAdditive = added.length > 0 || permissive.length > 0;
-  console.log(`\nverdict: ${isBreaking ? 'BREAKING (needs a major)' : isAdditive ? 'ADDITIVE (needs a minor)' : 'NO CHANGE (patch is fine)'}`);
+  const suffix = { BREAKING: ' (needs a major)', ADDITIVE: ' (needs a minor)', 'NO CHANGE': ' (patch is fine)' }[verdict];
+  console.log(`\nverdict: ${verdict}${suffix}`);
 }
 
-main();
+// Only run when invoked directly, so the tests can import `compare`.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  report(compare(path.dirname(OLD), path.dirname(NEW), { baseUrl: WORK }));
+}

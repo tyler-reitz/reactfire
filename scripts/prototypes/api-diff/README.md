@@ -105,12 +105,15 @@ and turn the version rule into real semver. It would not remove the diff itself.
 
 ## Two more things worth knowing
 
-**5. Synthetic `.d.ts` fixtures do not behave like emitted ones.** A `.d.ts`
-written without imports surfaces its local types as module exports, where the
-same code in a `.ts` file does not. Real reactfire is unaffected (88 exports,
-with `InitSdkHook`, `ObservableStatusBase` and `FirebaseSdks` correctly absent),
-but a hand-written fixture can quietly test something other than what was
-intended. Give fixtures imports.
+**5. A `.d.ts` needs a trailing `export {};` or its local types become
+exports.** Without it, `getExportsOfModule` reports unexported top-level
+declarations as part of the public surface; the same code in a `.ts` file does
+not, and `export *` does not filter them out either. `tsc` appends `export {}`
+to emitted declaration files for exactly this reason, which is why real
+reactfire is unaffected (88 exports, with `InitSdkHook`, `ObservableStatusBase`
+and `FirebaseSdks` correctly absent). **A hand-written fixture without it models
+something the compiler would never emit.** Every fixture here ends with
+`export {};`, and one test guards that.
 
 **6. Stripping private members needs the AST, not line matching.** A member
 whose declaration spans lines leaves its own tail behind:
@@ -125,10 +128,26 @@ The file then fails to parse and the comparison becomes meaningless rather than
 failing loudly. `strip-private.mjs` removes whole member spans via the AST, and
 also handles `#private` fields, which are equally nominal.
 
+## Tests
+
+```sh
+npm run test:apidiff      # no emulators, no network
+```
+
+16 tests over fixture pairs in `test/fixtures/api-diff/`, covering each verdict,
+root-cause attribution, the cycle path, constrained generics in both directions,
+the nominal-typing trap (including that it _does_ misreport without stripping),
+and `stripPrivateMembers` itself. Mutation-tested: counting permissive changes
+as breaking, dropping root attribution, ignoring removed exports, and either
+half of the private-member stripping all kill tests.
+
+The self-comparison control (a version against itself must be NO CHANGE) is the
+highest-value one, since it is what caught the nominal-typing bug.
+
 ## Before this could ship
 
-- No tests. The self-comparison control (a version against itself must be
-  NO CHANGE) is the single highest-value one and should be permanent.
 - No CI wiring, and no decision on how it slots into the existing `types` check.
-- Symbols are reported by name, so a root cause in a submodule reads the same as
-  one in the entry point.
+- Symbols are reported by bare name, so a root cause in a submodule reads the
+  same as one in the entry point.
+- `compare()` writes a probe file into the directory it is given, so callers
+  must pass a copy.

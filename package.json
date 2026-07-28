@@ -29,6 +29,7 @@
     "test:useObservable": "vitest useObservable",
     "test:firebaseApp": "vitest firebaseApp",
     "test:gate": "vitest release-gate",
+    "test:apidiff": "vitest api-diff",
     "test:loads": "vitest entry-load",
     "format": "prettier src test scripts vite.config.ts -w",
     "lint": "eslint src/* test/* scripts/* vite.config.ts",
