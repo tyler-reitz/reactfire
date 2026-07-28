@@ -1,9 +1,12 @@
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
   collectImports,
+  fetchPublished,
   findCjsMarkers,
+  isNotPublished,
   listTypeFiles,
   listEsmFiles,
   diffLines,
@@ -486,15 +489,116 @@ describe('runChecks', () => {
     expect(failures).toEqual([]);
   });
 
-  // A registry outage must not wedge CI on a pull request that has nothing to
-  // do with the published surface. The bundle checks still run.
-  it('skips the comparison checks when there is no published release', () => {
+  // Bootstrap: nothing has ever been published, so there is genuinely nothing
+  // to compare against. The bundle checks still run.
+  it('skips the comparison checks when nothing has ever been published', () => {
     const built = build({ esm: ESM_WITH_INLINED_CJS });
-    const { failures, notes } = runChecks(built.pkgDir, built.pkg, built.tarball, null, built.options);
+    const published = { unavailable: { reason: 'not-published', tag: 'latest' } };
+    const { failures, notes } = runChecks(built.pkgDir, built.pkg, built.tarball, published, built.options);
     expect(failures.find((f) => f.check === 'types')).toBeUndefined();
     expect(failures.find((f) => f.check === 'size')).toBeUndefined();
     expect(failures.find((f) => f.check === 'no-cjs-in-esm')).toBeDefined();
     expect(notes.join('\n')).toContain('no published release');
+  });
+
+  it('treats a bare null as nothing published', () => {
+    const built = build({ esm: ESM_CLEAN });
+    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, null, built.options);
+    expect(failures).toEqual([]);
+  });
+
+  // The fail-open case. A skip is indistinguishable from a pass in the check's
+  // status, so a registry failure that skipped would turn a blip into a
+  // silently ungated release.
+  it('fails rather than skips when the published release could not be fetched', () => {
+    const built = build({ esm: ESM_CLEAN });
+    const published = { unavailable: { reason: 'fetch-failed', tag: 'latest', attempts: 3, detail: 'ETIMEDOUT' } };
+    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, published, built.options);
+    const types = failures.find((f) => f.check === 'types');
+    expect(types?.message).toContain('could not fetch');
+    expect(types?.detail).toContain('ETIMEDOUT');
+  });
+
+  // One cause, one failure: `size` cannot run either, but repeating the same
+  // registry error under a second check name just buries the real one.
+  it('reports a failed fetch once, not once per check', () => {
+    const built = build({ esm: ESM_CLEAN });
+    const published = { unavailable: { reason: 'fetch-failed', tag: 'latest', attempts: 3, detail: 'ETIMEDOUT' } };
+    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, published, built.options);
+    expect(failures.filter((f) => f.message.includes('could not fetch'))).toHaveLength(1);
+  });
+});
+
+describe('fetchPublished', () => {
+  let dir;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-fetch-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const failWith = (stderr) => () => {
+    const error = new Error('npm pack failed');
+    error.stderr = stderr;
+    throw error;
+  };
+
+  it('classifies a 404 as never published and does not retry it', () => {
+    let calls = 0;
+    const run = (...args) => {
+      calls++;
+      return failWith('npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/reactfire')(...args);
+    };
+    const result = fetchPublished(dir, { run, attempts: 3, backoffMs: 0 });
+    expect(result.unavailable.reason).toBe('not-published');
+    // Retrying a missing package just spends CI time to get the same answer.
+    expect(calls).toBe(1);
+  });
+
+  it('retries a transient failure and reports fetch-failed', () => {
+    let calls = 0;
+    const run = (...args) => {
+      calls++;
+      return failWith('npm error network request to https://registry.npmjs.org/reactfire failed, reason: ETIMEDOUT')(...args);
+    };
+    const result = fetchPublished(dir, { run, attempts: 3, backoffMs: 0 });
+    expect(result.unavailable.reason).toBe('fetch-failed');
+    expect(result.unavailable.attempts).toBe(3);
+    expect(calls).toBe(3);
+  });
+
+  it('succeeds if a retry succeeds', () => {
+    // Stand in for a real pack: write the tarball the second call claims to.
+    let calls = 0;
+    const run = (cmd, args) => {
+      calls++;
+      if (calls === 1) return failWith('ETIMEDOUT')();
+      const dest = args[args.indexOf('--pack-destination') + 1];
+      const pkgDir = path.join(dest, 'package');
+      fs.mkdirSync(pkgDir, { recursive: true });
+      fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: 'reactfire', version: '4.2.6' }));
+      execFileSync('tar', ['-czf', path.join(dest, 'reactfire-4.2.6.tgz'), '-C', dest, 'package']);
+      return JSON.stringify([{ filename: 'reactfire-4.2.6.tgz' }]);
+    };
+    const result = fetchPublished(dir, { run, attempts: 3, backoffMs: 0 });
+    expect(result.version).toBe('4.2.6');
+    expect(calls).toBe(2);
+  });
+});
+
+describe('isNotPublished', () => {
+  it('recognises the registry 404 shapes', () => {
+    expect(isNotPublished('npm error code E404')).toBe(true);
+    expect(isNotPublished('npm error 404 Not Found - GET https://registry.npmjs.org/reactfire')).toBe(true);
+  });
+
+  it('does not classify a network error as never published', () => {
+    expect(isNotPublished('request to https://registry.npmjs.org failed, reason: ETIMEDOUT')).toBe(false);
+    expect(isNotPublished('npm error code ECONNRESET')).toBe(false);
+    expect(isNotPublished(undefined)).toBe(false);
   });
 });
 

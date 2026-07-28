@@ -166,33 +166,81 @@ function extract(tarball, outDir) {
   return path.join(outDir, 'package');
 }
 
+/** Whether an `npm pack` failure means "no such published version". */
+export function isNotPublished(stderr) {
+  return /\bE404\b|404 Not Found|is not in this registry/i.test(String(stderr ?? ''));
+}
+
+/** Block the current thread. Used for retry backoff; the gate is synchronous. */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 /**
  * Download the currently published tarball and extract it.
  *
- * Returns null when there is nothing to compare against: the package has never
- * been published, or the registry is unreachable. Both are reported by the
- * caller as a skip rather than a failure, so a registry outage cannot wedge CI
- * on a pull request that has nothing to do with the published surface.
+ * Returns `{ pkgDir, tarball, version }` on success, or `{ unavailable }`
+ * describing why not.
+ *
+ * The two failure modes are deliberately not the same. "Never published" is a
+ * legitimate skip: at bootstrap there is genuinely nothing to compare against.
+ * A failed fetch is not, because a skip is indistinguishable from a pass in the
+ * check's status, which would turn a registry blip into a silently ungated
+ * release. So transient failures are retried and then reported as a failure,
+ * and the job is re-runnable. Wedging a pull request for a few minutes is a
+ * better trade than a gate that quietly stops gating.
  */
-export function fetchPublished(outDir, { tag = COMPARE_TAG, name = 'reactfire' } = {}) {
+export function fetchPublished(outDir, { tag = COMPARE_TAG, name = 'reactfire', attempts = 3, backoffMs = 2000, run = execFileSync } = {}) {
   const dir = path.join(outDir, 'published');
   fs.mkdirSync(dir, { recursive: true });
-  let filename;
-  try {
-    const stdout = execFileSync('npm', ['pack', `${name}@${tag}`, '--json', '--pack-destination', dir], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-      encoding: 'utf8',
-      maxBuffer: 64 * 1024 * 1024,
-    });
-    const report = JSON.parse(stdout);
-    const entry = Array.isArray(report) ? report[0] : Object.values(report)[0];
-    filename = entry.filename;
-  } catch {
-    return null;
+
+  let last = '';
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const stdout = run('npm', ['pack', `${name}@${tag}`, '--json', '--pack-destination', dir], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        encoding: 'utf8',
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      const report = JSON.parse(stdout);
+      const entry = Array.isArray(report) ? report[0] : Object.values(report)[0];
+      const tarball = path.join(dir, entry.filename);
+      const pkgDir = extract(tarball, dir);
+      return { pkgDir, tarball, version: readPackageJson(pkgDir).version };
+    } catch (error) {
+      last = String(error.stderr ?? error.message ?? '');
+      // A missing package will still be missing on the next attempt.
+      if (isNotPublished(last)) return { unavailable: { reason: 'not-published', tag, detail: last.trim().split('\n')[0] ?? '' } };
+      if (attempt < attempts) sleepSync(backoffMs * attempt);
+    }
   }
-  const tarball = path.join(dir, filename);
-  const pkgDir = extract(tarball, dir);
-  return { pkgDir, tarball, version: readPackageJson(pkgDir).version };
+  return { unavailable: { reason: 'fetch-failed', tag, attempts, detail: last.trim().split('\n').slice(-1)[0] ?? '' } };
+}
+
+/**
+ * Report why a comparison check could not run, and say whether it was allowed.
+ * Returns true when the check should be treated as skipped rather than failed.
+ */
+export function reportUnavailable(check, published, report) {
+  // A bare null (no published package at all) stays a skip.
+  const info = published?.unavailable ?? { reason: 'not-published' };
+  if (info.reason === 'not-published') {
+    report.note(`${check}: no published release to compare against, skipped`);
+    return true;
+  }
+  report.fail(
+    check,
+    `could not fetch the published release to compare against (${info.attempts} attempts)`,
+    [
+      info.detail ? `    ${info.detail}` : '',
+      '    This is not a skip: without the published package the check cannot',
+      '    run, and passing here would mean the gate silently stopped gating.',
+      '    Re-run the job; if npm is down this will clear on its own.',
+    ]
+      .filter(Boolean)
+      .join('\n'),
+  );
+  return false;
 }
 
 /**
@@ -508,8 +556,8 @@ export function checkTypes(pkgDir, pkg, published, report, { acceptedFile = ACCE
   const distTypes = path.join(pkgDir, 'dist');
   const current = listTypeFiles(distTypes);
 
-  if (!published) {
-    report.note('types: no published release to compare against, skipped');
+  if (!published?.version) {
+    reportUnavailable('types', published, report);
     return;
   }
 
@@ -596,8 +644,9 @@ export function measurePackage(pkgDir, pkg, tarball) {
 export function checkSize(pkgDir, pkg, tarball, published, report, { acceptedFile = ACCEPTED_FILE, publishedMetrics } = {}) {
   const current = measurePackage(pkgDir, pkg, tarball);
 
-  if (!published) {
-    report.note('size: no published release to compare against, skipped');
+  if (!published?.version) {
+    // `types` already reported the reason; stay quiet rather than doubling it.
+    if (published?.unavailable?.reason !== 'fetch-failed') report.note('size: no published release to compare against, skipped');
     return;
   }
 
@@ -714,11 +763,16 @@ function main() {
     const published = fetchPublished(tmp);
 
     console.log(`release gate: reactfire@${pkg.version} (${path.basename(tarball)})`);
-    console.log(published ? `comparing against reactfire@${published.version} (npm ${COMPARE_TAG})\n` : `no published release to compare against\n`);
+    console.log(
+      published.version
+        ? `comparing against reactfire@${published.version} (npm ${COMPARE_TAG})\n`
+        : `no published release available (${published.unavailable.reason})\n`,
+    );
 
     if (accept) {
-      if (!published) {
-        console.error('nothing to acknowledge against: could not fetch the published release.');
+      if (!published.version) {
+        console.error(`nothing to acknowledge against: ${published.unavailable.reason}.`);
+        if (published.unavailable.detail) console.error(`  ${published.unavailable.detail}`);
         return 2;
       }
       const body = writeAccepted(pkgDir, pkg, tarball, published);

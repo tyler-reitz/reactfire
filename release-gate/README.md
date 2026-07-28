@@ -13,11 +13,18 @@ The `types` and `size` checks compare against the release currently on npm, whic
 the gate downloads with `npm pack reactfire@latest`. That is what
 [#749](https://github.com/FirebaseExtended/reactfire/issues/749) specifies, and
 it cannot drift: a copy checked into the repo goes stale the moment a release is
-published without refreshing it, and reactfire is published by hand. If the
-registry is unreachable, or the package has never been published, those two
-checks are skipped with a note rather than failing, so an outage cannot wedge an
-unrelated pull request. The bundle checks do not depend on the network and always
-run.
+published without refreshing it, and reactfire is published by hand. The bundle
+checks need no network and always run.
+
+The two ways that download can fail are treated differently, on purpose:
+
+- **Nothing published yet** is a legitimate skip. At bootstrap there is
+  genuinely nothing to compare against.
+- **The fetch failed** is a failure, after three attempts with backoff. Skipping
+  would be indistinguishable from passing in the check's status, so a registry
+  blip would quietly produce an ungated release. Re-run the job instead; if npm
+  is down it clears on its own. A wedged pull request is a better outcome than a
+  gate that has silently stopped gating.
 
 ## Why
 
