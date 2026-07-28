@@ -103,10 +103,32 @@ So the two checks answer different questions:
 Wiring this in would remove the `gate:accept` judgement call for the common case
 and turn the version rule into real semver. It would not remove the diff itself.
 
+## Two more things worth knowing
+
+**5. Synthetic `.d.ts` fixtures do not behave like emitted ones.** A `.d.ts`
+written without imports surfaces its local types as module exports, where the
+same code in a `.ts` file does not. Real reactfire is unaffected (88 exports,
+with `InitSdkHook`, `ObservableStatusBase` and `FirebaseSdks` correctly absent),
+but a hand-written fixture can quietly test something other than what was
+intended. Give fixtures imports.
+
+**6. Stripping private members needs the AST, not line matching.** A member
+whose declaration spans lines leaves its own tail behind:
+
+```ts
+private callback: (   // the regex deletes this line only
+    event: string,    // and these survive as garbage
+) => void;
+```
+
+The file then fails to parse and the comparison becomes meaningless rather than
+failing loudly. `strip-private.mjs` removes whole member spans via the AST, and
+also handles `#private` fields, which are equally nominal.
+
 ## Before this could ship
 
-- `strip-private.mjs` is a line regex; it should walk the AST.
-- `collectLocalTypes` keys by bare name, so two files declaring the same local
-  type name can mis-attribute a root. Key by file and name.
-- No tests, no CI wiring, no decision on how it slots into the existing `types`
-  check.
+- No tests. The self-comparison control (a version against itself must be
+  NO CHANGE) is the single highest-value one and should be permanent.
+- No CI wiring, and no decision on how it slots into the existing `types` check.
+- Symbols are reported by name, so a root cause in a submodule reads the same as
+  one in the entry point.
