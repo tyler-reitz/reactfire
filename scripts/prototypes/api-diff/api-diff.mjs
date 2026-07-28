@@ -1,14 +1,20 @@
 /**
- * PROTOTYPE step 2: collapse the cascade.
+ * PROTOTYPE: classify a .d.ts change as additive or breaking.
  *
- * One root change flags every symbol that mentions it. In 4.2.3 -> 4.2.4 the
- * ObservableStatus union made 35 exports fail, but there is only one thing to
- * decide about. Reporting all 35 as peers buries the actual change.
+ * Not wired into anything. See README.md for the approach, what it has been
+ * validated against, and what would have to happen before it could ship.
  *
- * Approach: build a reference graph over the exported symbols (A references B
- * if B's name appears in A's declaration), then a failing symbol is a ROOT only
- * if it does not reference any other failing symbol. Everything else is
- * DERIVED and is reported as a consequence, attributed to what it came from.
+ * Two ideas carry the whole thing:
+ *
+ * 1. Let tsc decide. For every symbol exported by both versions, emit probe
+ *    lines asserting assignability in each direction, compile, read the errors.
+ *    Only `new -> old` failing is a consumer break; the other direction alone
+ *    means the API became more permissive.
+ *
+ * 2. Collapse the cascade. One root change flags everything that mentions it:
+ *    the ObservableStatus union made 32 exports fail when there was a single
+ *    decision to make. A failing symbol is a ROOT only if it does not reference
+ *    another failing one, so the rest are reported as consequences.
  */
 
 import path from 'node:path';
@@ -36,26 +42,9 @@ const COMPILER_OPTIONS = {
   baseUrl: WORK,
 };
 
-/**
- * Every type declaration in the package, exported or not, by name.
- *
- * The reference graph has to see local types. `useInitAuth` is declared as
- * `InitSdkHook<Auth>`, and `InitSdkHook` is a non-exported alias returning
- * `ObservableStatus<Sdk>`. Walking only exported names made `useInitAuth` look
- * like an independent root when its declaration is byte-identical across
- * versions and the only thing that changed was ObservableStatus.
- */
-function collectLocalTypes(program) {
-  const locals = new Map();
-  for (const file of program.getSourceFiles()) {
-    if (file.isDeclarationFile && file.fileName.includes('/node_modules/')) continue;
-    for (const statement of file.statements) {
-      if ((ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement) || ts.isClassDeclaration(statement)) && statement.name) {
-        locals.set(statement.name.text, statement);
-      }
-    }
-  }
-  return locals;
+/** Follow import/export aliases to the symbol that actually declares something. */
+function resolveAlias(checker, symbol) {
+  return symbol && symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
 }
 
 function readExports(entry) {
@@ -64,26 +53,41 @@ function readExports(entry) {
   const source = program.getSourceFile(entry);
   const moduleSymbol = checker.getSymbolAtLocation(source);
   const symbols = checker.getExportsOfModule(moduleSymbol);
-  const names = new Set(symbols.map((s) => s.getName()));
-  const locals = collectLocalTypes(program);
+  // Identity, not name. Two files can each declare a local type called
+  // `Helper`, and a name-keyed map would follow the wrong one and mis-attribute
+  // the root cause. The checker resolves each identifier to the symbol it
+  // actually refers to, which removes the collision entirely.
+  const exportSymbols = new Set(symbols.map((s) => resolveAlias(checker, s)));
 
-  /** Exported names reachable from a declaration, through local types. */
+  /**
+   * Exported symbols reachable from a declaration, walking through local types.
+   *
+   * The graph has to see non-exported types. `useInitAuth` is declared as
+   * `InitSdkHook<Auth>`, and `InitSdkHook` is a local alias returning
+   * `ObservableStatus<Sdk>`. Stopping at exported names made `useInitAuth` look
+   * like an independent root when its declaration is byte-identical across
+   * versions and the only thing that changed was ObservableStatus.
+   */
   const reachableExports = (startDecls, self) => {
     const found = new Set();
-    const seenLocals = new Set();
+    const seen = new Set();
     const walk = (node) => {
       if (ts.isIdentifier(node)) {
-        const text = node.text;
-        if (names.has(text) && text !== self) {
-          found.add(text);
-          // An exported symbol is where attribution stops: if it also changed,
-          // it is the thing to report, and its own dependencies are its story.
-          return;
-        }
-        if (locals.has(text) && !seenLocals.has(text)) {
-          seenLocals.add(text);
-          walk(locals.get(text));
-          return;
+        const symbol = resolveAlias(checker, checker.getSymbolAtLocation(node));
+        if (symbol && !seen.has(symbol)) {
+          if (exportSymbols.has(symbol)) {
+            // An exported symbol is where attribution stops: if it changed too,
+            // it is the thing to report, and its dependencies are its story.
+            if (symbol.getName() !== self) found.add(symbol.getName());
+            return;
+          }
+          // A local type: keep going, its contents are part of this symbol.
+          const decls = (symbol.declarations ?? []).filter((d) => ts.isInterfaceDeclaration(d) || ts.isTypeAliasDeclaration(d) || ts.isClassDeclaration(d));
+          if (decls.length > 0) {
+            seen.add(symbol);
+            for (const decl of decls) walk(decl);
+            return;
+          }
         }
       }
       ts.forEachChild(node, walk);
