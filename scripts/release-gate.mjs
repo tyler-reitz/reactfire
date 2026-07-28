@@ -9,24 +9,36 @@
  *   1. no CJS interop / dynamic `require` in the ESM entry      (issue #765, item 1)
  *   2. externals stay external, nothing unexpected is inlined   (issue #765, item 2)
  *   3. every path in `exports`/`main`/`module`/`typings` exists  (issue #765, item 4)
- *   4. emitted `.d.ts` match the accepted baseline               (issue #749)
- *   5. bundle size stays within tolerance of the baseline        (issue #765, item 5)
+ *   4. emitted `.d.ts` match the last published release          (issue #749)
+ *   5. bundle size stays within tolerance of it                  (issue #765, item 5)
  *
  * Usage:
  *   node scripts/release-gate.mjs [tarball]   verify (packs one if not given)
- *   node scripts/release-gate.mjs --accept    re-record the baseline
+ *   node scripts/release-gate.mjs --accept    record an acknowledgment
  *
- * Checks 4 and 5 compare against `release-gate/baseline/`, which is checked in.
- * Updating it is a deliberate act (`npm run gate:accept`) that shows the type and
- * size delta as a reviewable diff in the pull request, which is what #749 asks
- * for: a non-additive type change cannot land without someone acknowledging it
- * and making the semver call.
+ * Checks 4 and 5 compare against the tarball currently on npm (`npm pack
+ * reactfire@latest`), which is what #749 specifies. Comparing against a copy
+ * checked into the repo would drift the moment a release is published without
+ * refreshing it, and reactfire is published by hand, so that path is live.
+ *
+ * Because there is no checked-in copy to diff against, the acknowledgment is a
+ * fingerprint: `release-gate/accepted.json` records a digest of the type surface
+ * and the npm version it was taken against. A type change fails the gate until
+ * someone runs `npm run gate:accept` and commits that file, so the semver call
+ * still has to be made at pull-request time and still shows up in review. The
+ * file is a few lines rather than a mirrored copy of every `.d.ts`, so there is
+ * no second type surface to maintain.
+ *
+ * An acknowledgment is scoped to the version it was taken against. When a new
+ * release lands on npm, a stale acknowledgment stops matching and has to be
+ * retaken, so it cannot silently bless a later change.
  *
  * The exported helpers below are covered by test/release-gate.test.mjs. A gate
  * that silently stops gating is worse than no gate, so the detection logic is
  * pinned by tests rather than by having been checked by hand once.
  */
 
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
@@ -35,9 +47,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
-const BASELINE_DIR = path.join(ROOT, 'release-gate', 'baseline');
-const BASELINE_TYPES = path.join(BASELINE_DIR, 'types');
-const BASELINE_METRICS = path.join(BASELINE_DIR, 'metrics.json');
+const ACCEPTED_FILE = path.join(ROOT, 'release-gate', 'accepted.json');
+
+// The dist-tag the gate compares against. `latest` is what an unpinned consumer
+// upgrade resolves to, which is the population #749 is about.
+export const COMPARE_TAG = 'latest';
 
 // Bare specifiers the ESM build is allowed to leave as runtime imports.
 // Anything else showing up here means a dependency got externalized by accident;
@@ -150,6 +164,83 @@ function pack(outDir) {
 function extract(tarball, outDir) {
   execFileSync('tar', ['-xzf', tarball, '-C', outDir]);
   return path.join(outDir, 'package');
+}
+
+/**
+ * Download the currently published tarball and extract it.
+ *
+ * Returns null when there is nothing to compare against: the package has never
+ * been published, or the registry is unreachable. Both are reported by the
+ * caller as a skip rather than a failure, so a registry outage cannot wedge CI
+ * on a pull request that has nothing to do with the published surface.
+ */
+export function fetchPublished(outDir, { tag = COMPARE_TAG, name = 'reactfire' } = {}) {
+  const dir = path.join(outDir, 'published');
+  fs.mkdirSync(dir, { recursive: true });
+  let filename;
+  try {
+    const stdout = execFileSync('npm', ['pack', `${name}@${tag}`, '--json', '--pack-destination', dir], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    const report = JSON.parse(stdout);
+    const entry = Array.isArray(report) ? report[0] : Object.values(report)[0];
+    filename = entry.filename;
+  } catch {
+    return null;
+  }
+  const tarball = path.join(dir, filename);
+  const pkgDir = extract(tarball, dir);
+  return { pkgDir, tarball, version: readPackageJson(pkgDir).version };
+}
+
+/**
+ * Fingerprint of a type surface: the file list and every file's contents.
+ *
+ * This is what `release-gate/accepted.json` records instead of a copy of the
+ * `.d.ts` files themselves. It is enough to tell "the surface someone reviewed"
+ * from "the surface being shipped now", which is all the acknowledgment needs to
+ * do, and it keeps the committed artifact to one line.
+ */
+export function typesDigest(dir, files = listTypeFiles(dir)) {
+  const hash = createHash('sha256');
+  for (const file of files) {
+    hash.update(file);
+    hash.update('\0');
+    hash.update(fs.readFileSync(path.join(dir, file)));
+    hash.update('\0');
+  }
+  return `sha256:${hash.digest('hex')}`;
+}
+
+/** Parse "1.2.3" (ignoring any prerelease suffix) into [major, minor, patch]. */
+export function parseVersion(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version ?? ''));
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+}
+
+/**
+ * Whether `candidate` is more than a patch bump over `published`.
+ *
+ * Used only to decide whether a release is allowed to carry a type change.
+ * Returns null when either version is unparseable, which the caller treats as
+ * "cannot tell" rather than as a pass or a fail.
+ */
+export function isMinorOrMajorBump(candidate, published) {
+  const a = parseVersion(candidate);
+  const b = parseVersion(published);
+  if (!a || !b) return null;
+  return a[0] > b[0] || (a[0] === b[0] && a[1] > b[1]);
+}
+
+export function readAccepted(file = ACCEPTED_FILE) {
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -405,136 +496,193 @@ export function checkExportsMap(pkgDir, pkg, report) {
   }
 }
 
-export function checkTypes(pkgDir, report, { accept = false, baselineTypes = BASELINE_TYPES } = {}) {
+/**
+ * Diff the candidate's emitted `.d.ts` against the published release (#749).
+ *
+ * A difference is not by itself a failure: adding a hook legitimately changes
+ * the type surface. What fails is a difference nobody acknowledged, so the
+ * decision "is this additive or breaking, and what bump does it need" has to be
+ * made by a person and shows up in review.
+ */
+export function checkTypes(pkgDir, pkg, published, report, { acceptedFile = ACCEPTED_FILE } = {}) {
   const distTypes = path.join(pkgDir, 'dist');
   const current = listTypeFiles(distTypes);
 
-  if (accept) {
-    fs.rmSync(baselineTypes, { recursive: true, force: true });
-    for (const file of current) {
-      const dest = path.join(baselineTypes, file);
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.copyFileSync(path.join(distTypes, file), dest);
-    }
-    console.log(`recorded ${current.length} type file(s) to release-gate/baseline/types/`);
+  if (!published) {
+    report.note('types: no published release to compare against, skipped');
     return;
   }
 
-  const baseline = listTypeFiles(baselineTypes);
-  if (baseline.length === 0) {
-    report.fail('types', 'no accepted type baseline found', '    Run `npm run gate:accept` to record one, and commit the result.');
-    return;
-  }
+  const publishedTypes = path.join(published.pkgDir, 'dist');
+  const baseline = listTypeFiles(publishedTypes);
 
   const added = current.filter((f) => !baseline.includes(f));
   const removed = baseline.filter((f) => !current.includes(f));
   const changed = [];
   for (const file of current.filter((f) => baseline.includes(f))) {
-    const before = fs.readFileSync(path.join(baselineTypes, file), 'utf8');
+    const before = fs.readFileSync(path.join(publishedTypes, file), 'utf8');
     const after = fs.readFileSync(path.join(distTypes, file), 'utf8');
     if (before !== after) changed.push({ file, diff: diffLines(before, after) });
   }
 
-  if (added.length === 0 && removed.length === 0 && changed.length === 0) return;
-
-  const detail = [];
-  if (removed.length > 0) detail.push(`    removed declaration file(s): ${removed.join(', ')}`);
-  if (added.length > 0) detail.push(`    new declaration file(s): ${added.join(', ')}`);
-  for (const { file, diff } of changed) {
-    detail.push(`    --- dist/${file}`, diff);
+  if (added.length === 0 && removed.length === 0 && changed.length === 0) {
+    report.note(`types: identical to reactfire@${published.version}`);
+    return;
   }
-  detail.push(
-    '',
-    '    The published type surface changed. Decide whether this is additive',
-    '    (patch is fine) or non-additive (needs a minor or major bump plus a',
-    '    changelog note), then run `npm run gate:accept` and commit the',
-    '    updated baseline in the same pull request. See #749.',
-  );
-  report.fail(
-    'types',
-    `emitted .d.ts differ from the accepted baseline (${changed.length} changed, ${added.length} added, ${removed.length} removed)`,
-    detail.join('\n'),
-  );
+
+  const summary = `${changed.length} changed, ${added.length} added, ${removed.length} removed`;
+  const digest = typesDigest(distTypes, current);
+  const accepted = readAccepted(acceptedFile);
+  const acknowledged = accepted?.types === digest && accepted?.against === published.version;
+
+  if (!acknowledged) {
+    const detail = [];
+    if (removed.length > 0) detail.push(`    removed declaration file(s): ${removed.join(', ')}`);
+    if (added.length > 0) detail.push(`    new declaration file(s): ${added.join(', ')}`);
+    for (const { file, diff } of changed) {
+      detail.push(`    --- dist/${file}`, diff);
+    }
+    // A digest recorded against an older release is the stale-acknowledgment
+    // case: say so, because "run gate:accept" reads as a no-op otherwise.
+    if (accepted && accepted.against !== published.version) {
+      detail.push('', `    release-gate/accepted.json was taken against ${accepted.against}, but`, `    ${published.version} is now published. Retake it.`);
+    }
+    detail.push(
+      '',
+      '    The published type surface changed. Decide whether this is additive',
+      '    (patch is fine) or non-additive (needs a minor or major bump plus a',
+      '    changelog note), then run `npm run gate:accept` and commit',
+      '    release-gate/accepted.json in the same pull request. See #749.',
+    );
+    report.fail('types', `emitted .d.ts differ from reactfire@${published.version} (${summary})`, detail.join('\n'));
+    return;
+  }
+
+  report.note(`types: ${summary} vs reactfire@${published.version}, acknowledged in release-gate/accepted.json`);
+
+  // Version rule. During normal development package.json carries the published
+  // version (the bump is its own commit at release time, e.g. 7f93210 "4.2.6"),
+  // so there is nothing to assert. Once it moves, this is a release candidate
+  // and a changed type surface may not ship as a patch, which is exactly how
+  // 4.2.4 broke consumer builds.
+  if (pkg.version === published.version) return;
+  const bumped = isMinorOrMajorBump(pkg.version, published.version);
+  if (bumped === false) {
+    report.fail(
+      'types',
+      `version ${pkg.version} is a patch bump over ${published.version}, but the type surface changed`,
+      [
+        '    A type change cannot ship as a patch: consumers on a caret range',
+        '    pick it up unattended, which is what 4.2.4 did. Cut this as a minor',
+        '    (or major, if it is breaking) and note it in the changelog.',
+      ].join('\n'),
+    );
+  }
 }
 
-export function checkSize(pkgDir, pkg, tarball, report, { accept = false, baselineMetrics = BASELINE_METRICS } = {}) {
+/** Measure the tarball and the declared entry points of one extracted package. */
+export function measurePackage(pkgDir, pkg, tarball) {
   // `module` is written "./dist/index.js" and `main` "dist/index.umd.cjs";
-  // normalize so the baseline keys do not churn if package.json is tidied.
+  // normalize so keys line up between the candidate and the published package.
   const entries = [pkg.module, pkg.main].filter((rel) => typeof rel === 'string').map(normalizeRelative);
-  const current = {};
+  const sizes = {};
   for (const rel of entries) {
     const file = path.join(pkgDir, rel);
-    if (fs.existsSync(file)) current[rel] = measure(file);
+    if (fs.existsSync(file)) sizes[rel] = measure(file);
   }
-  const packed = fs.statSync(tarball).size;
+  return { packed: fs.statSync(tarball).size, sizes };
+}
 
-  if (accept) {
-    fs.mkdirSync(path.dirname(baselineMetrics), { recursive: true });
-    fs.writeFileSync(baselineMetrics, `${JSON.stringify({ packed, sizes: current }, null, 2)}\n`);
-    console.log(`recorded bundle sizes to release-gate/baseline/metrics.json`);
+export function checkSize(pkgDir, pkg, tarball, published, report, { acceptedFile = ACCEPTED_FILE, publishedMetrics } = {}) {
+  const current = measurePackage(pkgDir, pkg, tarball);
+
+  if (!published) {
+    report.note('size: no published release to compare against, skipped');
     return;
   }
 
-  if (!fs.existsSync(baselineMetrics)) {
-    report.fail('size', 'no accepted size baseline found', '    Run `npm run gate:accept` to record one, and commit the result.');
-    return;
-  }
+  // `publishedMetrics` is a seam for the tests: measuring a real package cannot
+  // hit a precise delta, and the tolerance value itself needs pinning.
+  const before = publishedMetrics ?? measurePackage(published.pkgDir, readPackageJson(published.pkgDir), published.tarball);
+  const accepted = readAccepted(acceptedFile);
+  // Same acknowledgment as the type surface: an intended size move is recorded
+  // once, against a named published version, and stops applying when that
+  // version moves on.
+  const acknowledged =
+    accepted?.against === published.version &&
+    accepted?.size?.packed === current.packed &&
+    JSON.stringify(accepted?.size?.sizes ?? null) === JSON.stringify(current.sizes);
 
-  const recorded = JSON.parse(fs.readFileSync(baselineMetrics, 'utf8'));
+  const over = [];
 
   // Guards the whole tarball, not just the entry points. `files` includes
   // `src`, so anything that lands under src/ ships to npm, including a nested
   // node_modules if one is ever present at pack time.
-  if (typeof recorded.packed === 'number') {
-    const delta = (packed - recorded.packed) / recorded.packed;
+  const packedDelta = (current.packed - before.packed) / before.packed;
+  const packedPct = `${packedDelta >= 0 ? '+' : ''}${(packedDelta * 100).toFixed(1)}%`;
+  report.note(`tarball: ${current.packed} B (${packedPct} vs ${published.version} ${before.packed} B)`);
+  if (Math.abs(packedDelta) > SIZE_TOLERANCE) {
+    over.push({
+      message: `packed tarball size moved ${packedPct} (${before.packed} B -> ${current.packed} B), tolerance is ±${SIZE_TOLERANCE * 100}%`,
+      detail: '    Check what the `files` allowlist is picking up (`npm pack --dry-run`).',
+    });
+  }
+
+  for (const [rel, now] of Object.entries(current.sizes)) {
+    const was = before.sizes[rel];
+    if (!was) {
+      // A new entry point has nothing to compare against, which is a packaging
+      // change worth seeing but not a size regression.
+      report.note(`${rel}: ${now.gzip} B gzip (new entry, not in ${published.version})`);
+      continue;
+    }
+    const delta = (now.gzip - was.gzip) / was.gzip;
     const pct = `${delta >= 0 ? '+' : ''}${(delta * 100).toFixed(1)}%`;
-    report.note(`tarball: ${packed} B (${pct} vs baseline ${recorded.packed} B)`);
+    report.note(`${rel}: ${now.gzip} B gzip (${pct} vs ${published.version} ${was.gzip} B)`);
     if (Math.abs(delta) > SIZE_TOLERANCE) {
-      report.fail(
-        'size',
-        `packed tarball size moved ${pct} (${recorded.packed} B -> ${packed} B), tolerance is ±${SIZE_TOLERANCE * 100}%`,
-        [
-          '    Check what the `files` allowlist is picking up (`npm pack --dry-run`).',
-          '    If the change is intended, run `npm run gate:accept` and commit the',
-          '    updated baseline.',
-        ].join('\n'),
-      );
+      over.push({
+        message: `${rel} gzip size moved ${pct} (${was.gzip} B -> ${now.gzip} B), tolerance is ±${SIZE_TOLERANCE * 100}%`,
+        detail: '    A jump usually means a dependency got inlined; a drop usually means\n    something stopped being bundled.',
+      });
     }
   }
 
-  const baseline = recorded.sizes ?? {};
-  for (const [rel, now] of Object.entries(current)) {
-    const before = baseline[rel];
-    if (!before) {
-      report.fail('size', `no size baseline for ${rel}`, '    Run `npm run gate:accept` and commit the result.');
-      continue;
-    }
-    const delta = (now.gzip - before.gzip) / before.gzip;
-    const pct = `${delta >= 0 ? '+' : ''}${(delta * 100).toFixed(1)}%`;
-    report.note(`${rel}: ${now.gzip} B gzip (${pct} vs baseline ${before.gzip} B)`);
-    if (Math.abs(delta) > SIZE_TOLERANCE) {
-      report.fail(
-        'size',
-        `${rel} gzip size moved ${pct} (${before.gzip} B -> ${now.gzip} B), tolerance is ±${SIZE_TOLERANCE * 100}%`,
-        [
-          '    A jump usually means a dependency got inlined; a drop usually means',
-          '    something stopped being bundled. If the change is intended, run',
-          '    `npm run gate:accept` and commit the updated baseline.',
-        ].join('\n'),
-      );
-    }
+  if (over.length === 0) return;
+  if (acknowledged) {
+    report.note(`size: ${over.length} entr(y/ies) outside tolerance, acknowledged in release-gate/accepted.json`);
+    return;
+  }
+  for (const { message, detail } of over) {
+    report.fail('size', message, [detail, '    If the change is intended, run `npm run gate:accept` and commit', '    release-gate/accepted.json.'].join('\n'));
   }
 }
 
 /** Run every read-only check against an extracted package directory. */
-export function runChecks(pkgDir, pkg, tarball, options = {}) {
+export function runChecks(pkgDir, pkg, tarball, published, options = {}) {
   const report = createReport();
   checkNoCjsInEsm(pkgDir, pkg, report);
   checkExternals(pkgDir, pkg, report);
   checkExportsMap(pkgDir, pkg, report);
-  checkTypes(pkgDir, report, options);
-  checkSize(pkgDir, pkg, tarball, report, options);
+  checkTypes(pkgDir, pkg, published, report, options);
+  checkSize(pkgDir, pkg, tarball, published, report, options);
   return report;
+}
+
+/**
+ * Record an acknowledgment of the current build's type surface and sizes.
+ *
+ * Scoped to the published version it was taken against, so it expires on the
+ * next release rather than silently carrying forward.
+ */
+export function writeAccepted(pkgDir, pkg, tarball, published, file = ACCEPTED_FILE) {
+  const body = {
+    against: published.version,
+    types: typesDigest(path.join(pkgDir, 'dist')),
+    size: measurePackage(pkgDir, pkg, tarball),
+  };
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(body, null, 2)}\n`);
+  return body;
 }
 
 // ---------------------------------------------------------------------------
@@ -550,10 +698,10 @@ function main() {
     console.error('usage: node scripts/release-gate.mjs [tarball] | --accept');
     return 2;
   }
-  // Recording a baseline from an arbitrary tarball would silently bless
-  // whatever that build contained, including a regression.
+  // Acknowledging an arbitrary tarball would silently bless whatever that build
+  // contained, including a regression.
   if (accept && tarballArg) {
-    console.error('--accept records the baseline from the current build and takes no tarball argument.');
+    console.error('--accept acknowledges the current build and takes no tarball argument.');
     console.error('Build first (`npx tsc && npx vite build`), then run `npm run gate:accept`.');
     return 2;
   }
@@ -563,18 +711,23 @@ function main() {
     const tarball = tarballArg ? path.resolve(tarballArg) : pack(tmp);
     const pkgDir = extract(tarball, tmp);
     const pkg = readPackageJson(pkgDir);
+    const published = fetchPublished(tmp);
 
-    console.log(`release gate: reactfire@${pkg.version} (${path.basename(tarball)})\n`);
+    console.log(`release gate: reactfire@${pkg.version} (${path.basename(tarball)})`);
+    console.log(published ? `comparing against reactfire@${published.version} (npm ${COMPARE_TAG})\n` : `no published release to compare against\n`);
 
     if (accept) {
-      const report = createReport();
-      checkTypes(pkgDir, report, { accept });
-      checkSize(pkgDir, pkg, tarball, report, { accept });
-      console.log('\nbaseline updated. Review the diff and commit it.');
+      if (!published) {
+        console.error('nothing to acknowledge against: could not fetch the published release.');
+        return 2;
+      }
+      const body = writeAccepted(pkgDir, pkg, tarball, published);
+      console.log(`acknowledged against reactfire@${body.against}.`);
+      console.log('Review release-gate/accepted.json and commit it with the change it covers.');
       return 0;
     }
 
-    const { failures, notes } = runChecks(pkgDir, pkg, tarball);
+    const { failures, notes } = runChecks(pkgDir, pkg, tarball, published);
 
     for (const note of notes) console.log(`  ${note}`);
 
