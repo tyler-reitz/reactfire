@@ -22,6 +22,7 @@
  * Usage: node strip-private.mjs <dir> [<dir>...]
  */
 
+import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 import ts from 'typescript';
@@ -76,7 +77,10 @@ function stripTree(dir) {
   return count;
 }
 
-if (process.argv.length > 2) {
+// Only when invoked directly. Without this guard, importing the module ran the
+// CLI against the *importer's* argv, so `check.mjs <tarball>` tried to walk the
+// tarball as a directory.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   for (const dir of process.argv.slice(2)) {
     const changed = stripTree(path.resolve(dir));
     console.log(`stripped private members from ${changed} file(s) in ${dir}`);

@@ -37,6 +37,7 @@
     "analyze": "size-limit --why",
     "gate": "node scripts/release-gate.mjs",
     "loads": "node scripts/entry-load.mjs",
+    "apidiff": "node scripts/api-diff/check.mjs",
     "gate:accept": "node scripts/release-gate.mjs --accept",
     "docs": "typedoc --options typedoc.json && markdown-toc -i docs/use.md",
     "docs:fork": "typedoc --options typedoc.json --gitRemote upstream && markdown-toc -i docs/use.md"
