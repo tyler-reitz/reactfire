@@ -269,6 +269,27 @@ export function parseVersion(version) {
 }
 
 /**
+ * Whether the candidate is a release being cut, rather than an ordinary build.
+ *
+ * Not a string comparison against the published version. CI stamps an
+ * experimental version into package.json before packing (`4.2.6-exp.a0f4f4c`
+ * for published 4.2.6), so `!==` treats every pull-request build as a release
+ * candidate, and since the numeric core matches it then reads as a patch bump.
+ * That would have failed the first pull request to legitimately change the type
+ * surface, with a version error that had nothing to do with the change.
+ *
+ * Comparing the numeric core instead means a stamped build of the published
+ * version is correctly seen as "not a release", while a genuine bump (4.2.7,
+ * 4.3.0, and their prereleases) still is.
+ */
+export function isReleaseCandidate(candidate, published) {
+  const a = parseVersion(candidate);
+  const b = parseVersion(published);
+  if (!a || !b) return false;
+  return a[0] !== b[0] || a[1] !== b[1] || a[2] !== b[2];
+}
+
+/**
  * Whether `candidate` is more than a patch bump over `published`.
  *
  * Used only to decide whether a release is allowed to carry a type change.
@@ -613,7 +634,7 @@ export function checkTypes(pkgDir, pkg, published, report, { acceptedFile = ACCE
   // so there is nothing to assert. Once it moves, this is a release candidate
   // and a changed type surface may not ship as a patch, which is exactly how
   // 4.2.4 broke consumer builds.
-  if (pkg.version === published.version) return;
+  if (!isReleaseCandidate(pkg.version, published.version)) return;
   const bumped = isMinorOrMajorBump(pkg.version, published.version);
   if (bumped === false) {
     report.fail(
@@ -641,6 +662,25 @@ export function measurePackage(pkgDir, pkg, tarball) {
   return { packed: fs.statSync(tarball).size, sizes };
 }
 
+/**
+ * Whether a recorded set of measurements still describes the current build,
+ * within `SIZE_TOLERANCE`.
+ *
+ * Every entry must be present on both sides: an acknowledgment that predates a
+ * new entry point should not silently cover it.
+ */
+export function sizesMatch(accepted, current) {
+  if (!accepted || typeof accepted.packed !== 'number') return false;
+  const within = (a, b) => b > 0 && Math.abs((a - b) / b) <= SIZE_TOLERANCE;
+  if (!within(current.packed, accepted.packed)) return false;
+
+  const acceptedKeys = Object.keys(accepted.sizes ?? {}).sort();
+  const currentKeys = Object.keys(current.sizes ?? {}).sort();
+  if (acceptedKeys.join() !== currentKeys.join()) return false;
+
+  return currentKeys.every((key) => within(current.sizes[key].gzip, accepted.sizes[key].gzip));
+}
+
 export function checkSize(pkgDir, pkg, tarball, published, report, { acceptedFile = ACCEPTED_FILE, publishedMetrics } = {}) {
   const current = measurePackage(pkgDir, pkg, tarball);
 
@@ -657,10 +697,14 @@ export function checkSize(pkgDir, pkg, tarball, published, report, { acceptedFil
   // Same acknowledgment as the type surface: an intended size move is recorded
   // once, against a named published version, and stops applying when that
   // version moves on.
-  const acknowledged =
-    accepted?.against === published.version &&
-    accepted?.size?.packed === current.packed &&
-    JSON.stringify(accepted?.size?.sizes ?? null) === JSON.stringify(current.sizes);
+  //
+  // Matched within the tolerance rather than byte-exactly. `gate:accept` is run
+  // locally, but the numbers it records get compared against a CI build, and the
+  // two are never byte-identical: CI stamps an experimental version into the
+  // bundle before packing (4.2.6-exp.<sha>), which measured ~+0.5% on the
+  // tarball. Exact matching would mean no acknowledgment ever applied in CI, so
+  // an intended size change could not be landed at all.
+  const acknowledged = accepted?.against === published.version && sizesMatch(accepted?.size, current);
 
   const over = [];
 

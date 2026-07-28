@@ -131,10 +131,20 @@ was accepted, so editing the types afterwards invalidates it rather than riding
 along. And it is scoped to the published version it was taken against, so it
 expires on the next release instead of silently carrying forward.
 
-At release time the gate also checks the bump itself: once `package.json` moves
-off the published version, a changed type surface may not ship as a patch. During
-normal development the two match (the bump is its own commit, e.g. `7f93210`
-"4.2.6"), so there is nothing to assert and the rule stays quiet.
+At release time the gate also checks the bump itself: once `package.json` carries
+a different `major.minor.patch` from the published release, a changed type
+surface may not ship as a patch. During normal development the two match (the
+bump is its own commit, e.g. `7f93210` "4.2.6"), so there is nothing to assert
+and the rule stays quiet.
+
+The comparison is on the numeric core, not the version string, because CI stamps
+an experimental version into `package.json` before packing
+(`4.2.6-exp.<sha>` while 4.2.6 is published). A string comparison read every
+pull-request build as a release candidate and then, since the core matched, as a
+patch bump, which would have failed the first pull request to legitimately change
+the type surface. For the same reason the recorded sizes are matched within the
+tolerance rather than byte-exactly: `gate:accept` runs locally, its numbers are
+compared against a CI build, and the stamp alone makes those differ.
 
 Semantic additive/non-additive classification via api-extractor would remove the
 judgement call, but it is a much larger project and deliberately not attempted

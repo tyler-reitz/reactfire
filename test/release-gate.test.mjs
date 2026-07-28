@@ -12,9 +12,11 @@ import {
   diffLines,
   isAllowedExternal,
   isMinorOrMajorBump,
+  isReleaseCandidate,
   measurePackage,
   parseVersion,
   runChecks,
+  sizesMatch,
   typesDigest,
   writeAccepted,
 } from '../scripts/release-gate.mjs';
@@ -417,6 +419,46 @@ describe('runChecks', () => {
     expect(failures.find((f) => f.check === 'size')).toBeUndefined();
   });
 
+  // `gate:accept` runs locally, but its numbers are compared against a CI build,
+  // and CI stamps a version into the bundle so the two are never byte-identical.
+  // Exact matching meant no acknowledgment ever applied in CI.
+  it('honours an acknowledgment whose sizes differ slightly, as a CI build does', () => {
+    const built = build({ esm: ESM_CLEAN });
+    accept(built);
+    const recorded = JSON.parse(fs.readFileSync(built.options.acceptedFile, 'utf8'));
+    // Stand in for the version stamp: ~+0.5% on the tarball, ~+0.2% on entries.
+    recorded.size.packed = Math.round(recorded.size.packed / 1.005);
+    recorded.size.sizes['dist/index.js'].gzip = Math.round(recorded.size.sizes['dist/index.js'].gzip / 1.002);
+    fs.writeFileSync(built.options.acceptedFile, JSON.stringify(recorded));
+    const publishedMetrics = publishedMetricsScaled(built, { entry: 1.5 });
+    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, built.published, { ...built.options, publishedMetrics });
+    expect(failures.find((f) => f.check === 'size')).toBeUndefined();
+  });
+
+  // Tolerant matching must not become "any size is acknowledged".
+  it('does not honour an acknowledgment whose sizes moved beyond the tolerance', () => {
+    const built = build({ esm: ESM_CLEAN });
+    accept(built);
+    const recorded = JSON.parse(fs.readFileSync(built.options.acceptedFile, 'utf8'));
+    recorded.size.sizes['dist/index.js'].gzip = Math.round(recorded.size.sizes['dist/index.js'].gzip / 1.5);
+    fs.writeFileSync(built.options.acceptedFile, JSON.stringify(recorded));
+    const publishedMetrics = publishedMetricsScaled(built, { entry: 1.5 });
+    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, built.published, { ...built.options, publishedMetrics });
+    expect(failures.find((f) => f.check === 'size')).toBeDefined();
+  });
+
+  // An acknowledgment taken before a new entry point existed should not cover it.
+  it('does not honour an acknowledgment that predates a new entry point', () => {
+    const built = build({ esm: ESM_CLEAN });
+    accept(built);
+    const recorded = JSON.parse(fs.readFileSync(built.options.acceptedFile, 'utf8'));
+    delete recorded.size.sizes['dist/index.umd.cjs'];
+    fs.writeFileSync(built.options.acceptedFile, JSON.stringify(recorded));
+    const publishedMetrics = publishedMetricsScaled(built, { entry: 1.5 });
+    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, built.published, { ...built.options, publishedMetrics });
+    expect(failures.find((f) => f.check === 'size')).toBeDefined();
+  });
+
   // --- acknowledgment (#749) ---------------------------------------------
 
   const withChangedTypes = (overrides = {}) =>
@@ -481,6 +523,32 @@ describe('runChecks', () => {
     accept(built);
     const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, built.published, built.options);
     expect(failures).toEqual([]);
+  });
+
+  // CI stamps an experimental version into package.json before packing
+  // (`4.2.6-exp.<sha>` while 4.2.6 is published), so a `!==` comparison read
+  // every pull-request build as a release candidate and then, because the
+  // numeric core matches, as a patch bump. That would have failed the first PR
+  // to legitimately change types, with an error about the version.
+  it('does not treat CI’s experimental version stamp as a release', () => {
+    const built = withChangedTypes({ version: '4.2.6-exp.a0f4f4c', publishedVersion: '4.2.6' });
+    accept(built);
+    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, built.published, built.options);
+    expect(failures).toEqual([]);
+  });
+
+  // The stamp must not become a blanket exemption: a prerelease of a real bump
+  // is still a release, and still has to clear the rule.
+  it('still applies the rule to a prerelease of a genuine bump', () => {
+    const patch = withChangedTypes({ version: '4.2.7-exp.a0f4f4c', publishedVersion: '4.2.6' });
+    accept(patch);
+    const patchRun = runChecks(patch.pkgDir, patch.pkg, patch.tarball, patch.published, patch.options);
+    expect(patchRun.failures.find((f) => f.check === 'types')?.message).toContain('patch bump');
+
+    const minor = withChangedTypes({ version: '4.3.0-exp.a0f4f4c', publishedVersion: '4.2.6' });
+    accept(minor);
+    const minorRun = runChecks(minor.pkgDir, minor.pkg, minor.tarball, minor.published, minor.options);
+    expect(minorRun.failures).toEqual([]);
   });
 
   it('allows a patch release that does not touch the type surface', () => {
