@@ -1,11 +1,16 @@
-# API differ (PROTOTYPE, not wired into anything)
+# API differ
 
 Answers the question [#749](https://github.com/FirebaseExtended/reactfire/issues/749)
 actually asks and the release gate currently hands to a human: **is a `.d.ts`
 change additive or breaking?**
 
-Nothing here runs in CI. It is committed so the design work is not lost, and so
-the findings below are attached to the code that produced them.
+Runs in CI as the **Check API compatibility** job, between `build` and
+`publish`. Its own job rather than a sixth check in the release gate, because it
+needs `typescript` installed and keeping it out is what lets the gate stay
+dependency-free.
+
+The gate's textual `types` check answers _did anything change_. This answers
+_is the change breaking_, so the classification stops being a judgement call.
 
 ## Approach
 
@@ -21,7 +26,27 @@ const __t_n2o_Foo = <T>(v: N.Foo<T>): O.Foo<T> => v; // new assignable to old?
 
 Roughly 3.4s for the whole package.
 
-## Running it
+## Policy
+
+What is allowed depends on where the change is going, mirroring how the repo
+branches: v4 patches and minors land on `main`, breaking work lands on `v5`.
+
+| Situation                             | Result                            |
+| ------------------------------------- | --------------------------------- |
+| Breaking, targeting `main`            | **fail** (this is the 4.2.4 case) |
+| Breaking, targeting `v5` or elsewhere | pass, reported                    |
+| Additive or unchanged                 | pass, reported                    |
+
+On a release commit, once `package.json`'s numeric version moves off the
+published one, semver is enforced regardless of branch: a breaking surface needs
+a major, a changed one needs at least a minor. The branch carve-out does not
+apply to releases.
+
+```sh
+npm run apidiff -- reactfire.tgz --base main
+```
+
+## Running the comparison by hand
 
 ```sh
 mkdir -p /tmp/apidiff/old /tmp/apidiff/new

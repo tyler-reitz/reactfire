@@ -1,11 +1,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { compare } from '../scripts/prototypes/api-diff/api-diff.mjs';
-import { stripPrivateMembers } from '../scripts/prototypes/api-diff/strip-private.mjs';
+import { compare } from '../scripts/api-diff/api-diff.mjs';
+import { decide } from '../scripts/api-diff/check.mjs';
+import { stripPrivateMembers } from '../scripts/api-diff/strip-private.mjs';
 
 /**
- * Tests for the API differ prototype (scripts/prototypes/api-diff).
+ * Tests for the API differ (scripts/api-diff).
  *
  * The differ classifies a `.d.ts` change as breaking, additive, or no change,
  * which is the half of #749 the release gate currently hands to a human.
@@ -242,4 +243,55 @@ describe('fixture sanity', () => {
     },
     TIMEOUT,
   );
+});
+
+describe('decide', () => {
+  const at = (over) => decide({ candidateVersion: '4.2.6', publishedVersion: '4.2.6', base: 'main', ...over });
+
+  // On a pull request package.json still carries the published version, so the
+  // question is where the change is going, not what it is versioned as.
+  describe('on a pull request', () => {
+    // This is 4.2.4: a breaking type change landing on the v4 line.
+    it('rejects a breaking change targeting main', () => {
+      const decision = at({ verdict: 'BREAKING' });
+      expect(decision.ok).toBe(false);
+      expect(decision.reason).toContain('cannot target main');
+    });
+
+    // On v5 a breaking type change is the entire point.
+    it('allows a breaking change targeting v5', () => {
+      expect(at({ verdict: 'BREAKING', base: 'v5' }).ok).toBe(true);
+    });
+
+    it('allows additive and unchanged surfaces anywhere', () => {
+      expect(at({ verdict: 'ADDITIVE' }).ok).toBe(true);
+      expect(at({ verdict: 'NO CHANGE' }).ok).toBe(true);
+      expect(at({ verdict: 'ADDITIVE', base: 'v5' }).ok).toBe(true);
+    });
+  });
+
+  // Once package.json's numeric version moves off the published one this is a
+  // release, and semver applies whatever branch it is on.
+  describe('on a release', () => {
+    it('requires a major for a breaking surface', () => {
+      expect(at({ verdict: 'BREAKING', candidateVersion: '4.3.0' }).ok).toBe(false);
+      expect(at({ verdict: 'BREAKING', candidateVersion: '5.0.0' }).ok).toBe(true);
+    });
+
+    // The 4.2.4 mistake stated precisely: a changed surface cut as a patch.
+    it('requires at least a minor for an additive surface', () => {
+      expect(at({ verdict: 'ADDITIVE', candidateVersion: '4.2.7' }).ok).toBe(false);
+      expect(at({ verdict: 'ADDITIVE', candidateVersion: '4.3.0' }).ok).toBe(true);
+    });
+
+    it('allows a patch when nothing changed', () => {
+      expect(at({ verdict: 'NO CHANGE', candidateVersion: '4.2.7' }).ok).toBe(true);
+    });
+
+    // The branch carve-out must not leak into releases: cutting a breaking
+    // release off v5 as a minor is still wrong.
+    it('does not let the branch exempt a release', () => {
+      expect(at({ verdict: 'BREAKING', candidateVersion: '4.3.0', base: 'v5' }).ok).toBe(false);
+    });
+  });
 });
