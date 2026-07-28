@@ -164,16 +164,51 @@ not a test exercises it. Both regressions that shipped were invisible to source-
 level checks: the artifact regressed while the source was fine. The remaining
 four checks have no test-suite equivalent at all.
 
+## Entry-point load test
+
+Item 3 of [#765](https://github.com/FirebaseExtended/reactfire/issues/765), in
+[`scripts/entry-load.mjs`](../scripts/entry-load.mjs) and the **Verify package
+loads** CI job:
+
+```sh
+npm run build
+npm run loads -- reactfire.tgz            # both React majors
+npm run loads -- reactfire.tgz --react 19 # one, and --keep to inspect the fixture
+```
+
+It installs the packed tarball into a throwaway project with real `react` and
+`firebase`, then loads both entry points and checks that known exports are
+actually present. Run against React 18 and 19, matching the type-check matrix.
+
+**It is a separate script and a separate CI job on purpose.** It needs a real
+dependency tree, and keeping it out of `release-gate.mjs` is what lets the gate
+stay dependency-free.
+
+It catches the #759 class by observing the failure rather than by pattern-
+matching the artifact. Verified against the published tarballs:
+
+| Version | `import('reactfire')`           | `require('reactfire')` |
+| ------- | ------------------------------- | ---------------------- |
+| 4.2.4   | throws the `require` shim error | loads                  |
+| 4.2.5   | throws the `require` shim error | loads                  |
+| 4.2.6   | loads                           | loads                  |
+
+Note that only the ESM entry breaks, so a check that loaded one entry point
+would have missed it. `exports-map` cannot see this at all: every file it looks
+for is present in 4.2.5, the package just does not run.
+
 ## Not covered
 
-Items 3 and 7 of [#765](https://github.com/FirebaseExtended/reactfire/issues/765)
-are not implemented:
+Item 7 of [#765](https://github.com/FirebaseExtended/reactfire/issues/765) is not
+implemented:
 
-- **Both entry points load** (`import('reactfire')` and `require('reactfire')`
-  in a fixture with `react` and `firebase` installed).
-- **Runtime smoke render in CI** against a Next App Router and a Vite app. This
-  is the strongest check and the only one that catches runtime regressions the
-  static checks miss, but it is roughly a day of work on its own and adds real
-  CI minutes and flake surface.
+- **Runtime smoke render in CI** against a Next App Router and a Vite app,
+  rendering a data hook against the packed build.
+
+Its original justification was being the only check that catches a runtime
+regression by observing it. The entry-load test above now does that for the
+#759 class, so item 7's remaining unique value is narrower: failures that appear
+only in a browser or bundler context and not on a Node import. Worth re-scoping
+against roughly a day of work plus permanent CI minutes and flake surface.
 
 Neither is required to close the two holes that actually shipped.
