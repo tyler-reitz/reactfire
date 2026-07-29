@@ -63,8 +63,8 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       # Checks the packed tarball the publish job uploads verbatim, so this
       # verifies the exact bytes that ship. No `npm ci` needed: the gate uses
-      # node builtins plus `tar`, and downloads the published release to compare
-      # against with `npm pack reactfire@latest` (see release-gate/README.md).
+      # node builtins plus `tar`, and downloads the release to compare against
+      # with `npm pack` (see release-gate/README.md).
       - name: Release gate
         run: node scripts/release-gate.mjs reactfire-${{ github.run_id }}/reactfire.tgz
   verify-loads:

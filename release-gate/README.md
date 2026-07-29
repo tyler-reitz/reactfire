@@ -9,23 +9,29 @@ Implemented by [`scripts/release-gate.mjs`](../scripts/release-gate.mjs). It use
 only node builtins plus `tar` and `npm pack`, so the CI job needs no `npm ci` and
 cannot itself be broken by a dependency change.
 
-The `types` and `size` checks compare against the release currently on npm, which
-the gate downloads with `npm pack`. That is what
-[#749](https://github.com/FirebaseExtended/reactfire/issues/749) specifies, and
-it cannot drift: a copy checked into the repo goes stale the moment a release is
-published without refreshing it, and reactfire is published by hand. The bundle
-checks need no network and always run.
+This covers the **runtime** half of the release checks: does the built artifact
+still work. The **type** half, diffing the emitted `.d.ts` against the published
+release and applying semver to it, is
+[#749](https://github.com/FirebaseExtended/reactfire/issues/749) and is handled
+separately. It needs `typescript`, and keeping it out of this file is what lets
+the gate stay dependency-free.
+
+The `size` check compares against the release currently on npm, which the gate
+downloads with `npm pack`. That cannot drift: a copy checked into the repo goes
+stale the moment a release is published without refreshing it, and reactfire is
+published by hand. The bundle checks need no network and always run.
 
 ### Which release it compares against
 
 The newest published release **sharing the candidate's major** (`reactfire@^4`
 for a 4.x build), not the `latest` dist-tag.
 
-Using `latest` breaks the entire v4 line the moment 5.0.0 takes that tag. Every
-v4 candidate then reads as a release that is not a bump, because a lower major
-can never register as one, so maintenance releases, minors, and even the stamped
-canary builds CI produces would all fail against a type surface from a different
-major line. That is every v4 pull request, not just release cuts.
+Using `latest` breaks the entire v4 line the moment 5.0.0 takes that tag. A 4.2.7
+compared against 5.0.0 is a different version but not an increase, because a
+lower major can never register as a bump, so maintenance releases, minors, and
+even the stamped canary builds CI produces would all be measured against an
+artifact from a different major line. That is every v4 pull request, not just
+release cuts.
 
 Derived from the candidate rather than read from a per-branch dist-tag on
 purpose: a `v4` tag would have to be maintained correctly on every publish, and
@@ -33,9 +39,9 @@ reactfire is published by hand, so it would drift. Same reasoning that ruled out
 a committed baseline.
 
 When the candidate's major has nothing published yet (the `v5` line before 5.0.0
-ships), the gate falls back to `latest` and says so. Comparing a v5 build against
-the v4 surface is not meaningful, but it is better than skipping the checks
-outright, and the version rule still reads a major bump correctly.
+ships), the gate falls back to `latest` and says so. A v5 build measured against
+the v4 artifact is a weak comparison, but it is better than skipping the checks
+outright, and a genuine size regression still shows up against either baseline.
 
 The ways that download can fail are treated differently, on purpose:
 
@@ -69,13 +75,12 @@ are caught by this gate (verified by running it against the published 4.2.4 and
 
 ## Checks
 
-| Check           | What it catches                                                                                                                                                                                                                      |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `no-cjs-in-esm` | A CJS module inlined into **any** ESM chunk, i.e. the #759 crash. Matches the bare `require` identifier, since the output is minified and the shipped 4.2.5 bundle never literally wrote `require(`.                                 |
-| `externals`     | Externals getting inlined (duplicate React instance, the shim regression) or new dependencies leaking out as runtime imports.                                                                                                        |
-| `exports-map`   | Any path in `exports` / `main` / `module` / `typings` missing from the tarball.                                                                                                                                                      |
-| `types`         | Any change to the emitted `.d.ts` versus the published release, i.e. the #749 class. Covers added and removed declaration files as well as changed ones. On a release commit, also fails a changed type surface cut as a patch bump. |
-| `size`          | Packed tarball and entry-point gzip size moving more than ±2% from the published release.                                                                                                                                            |
+| Check           | What it catches                                                                                                                                                                                      |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `no-cjs-in-esm` | A CJS module inlined into **any** ESM chunk, i.e. the #759 crash. Matches the bare `require` identifier, since the output is minified and the shipped 4.2.5 bundle never literally wrote `require(`. |
+| `externals`     | Externals getting inlined (duplicate React instance, the shim regression) or new dependencies leaking out as runtime imports.                                                                        |
+| `exports-map`   | Any path in `exports` / `main` / `module` / `typings` missing from the tarball.                                                                                                                      |
+| `size`          | Packed tarball and entry-point gzip size moving more than ±2% from the published release.                                                                                                            |
 
 ### What `size` is and is not
 
@@ -119,74 +124,48 @@ The local pack stages from `git ls-files` plus `dist/`, not the working tree.
 untracked scratch work under `src/`. Staging keeps a local run comparable with
 what CI packs from a clean checkout.
 
-## Accepting a change
+## Accepting a size change
 
-A type or size change is not by itself a regression: adding a hook legitimately
-changes the type surface. What the gate refuses is a change nobody looked at. So
-when the change is intended:
+Size is the one check with no way to tell an intended change from a regression:
+there is no principled basis for deciding that a bundle growing 4% was meant. So
+when it was:
 
 ```sh
+npx tsc && npx vite build   # accept measures the current build
 npm run gate:accept
 ```
 
-Then **commit `accepted.json` in the same pull request**. It records a digest of
-the type surface, the measured sizes, and the published version they were taken
-against:
+Then **commit `accepted.json` in the same pull request**:
 
 ```json
 {
   "against": "4.2.6",
-  "types": "sha256:...",
   "size": { "packed": 130982, "sizes": { "dist/index.js": { "bytes": 0, "gzip": 16068 } } }
 }
 ```
 
-That file is the acknowledgement, and it is deliberately a fingerprint rather
-than a copy of every `.d.ts`. A checked-in copy would be a second type surface to
-maintain; a digest is a few lines, and reviewing the pull request that changes it
-means answering the question
-[#749](https://github.com/FirebaseExtended/reactfire/issues/749) is really about:
+It is scoped to the published version it was taken against, so a new release
+expires it instead of letting it silently carry forward.
 
-- Is this additive (a patch bump is fine), or non-additive (needs a minor or
-  major bump plus a changelog note)?
-
-Two properties make it hard to misuse. The digest covers the exact surface that
-was accepted, so editing the types afterwards invalidates it rather than riding
-along. And it is scoped to the published version it was taken against, so it
-expires on the next release instead of silently carrying forward.
-
-At release time the gate also checks the bump itself: once `package.json` carries
-a different `major.minor.patch` from the published release, a changed type
-surface may not ship as a patch. During normal development the two match (the
-bump is its own commit, e.g. `7f93210` "4.2.6"), so there is nothing to assert
-and the rule stays quiet.
-
-The comparison is on the numeric core, not the version string, because CI stamps
-an experimental version into `package.json` before packing
-(`4.2.6-exp.<sha>` while 4.2.6 is published). A string comparison read every
-pull-request build as a release candidate and then, since the core matched, as a
-patch bump, which would have failed the first pull request to legitimately change
-the type surface. For the same reason the recorded sizes are matched within the
-tolerance rather than byte-exactly: `gate:accept` runs locally, its numbers are
-compared against a CI build, and the stamp alone makes those differ.
-
-Semantic additive/non-additive classification via api-extractor would remove the
-judgement call, but it is a much larger project and deliberately not attempted
-here.
+The recorded sizes are matched within the tolerance rather than byte-exactly.
+`gate:accept` runs locally, its numbers get compared against a CI build, and the
+two are never byte-identical: CI stamps an experimental version into the bundle
+before packing (`4.2.6-exp.<sha>`), which measured about +0.5% on the tarball.
+Exact matching would mean no acknowledgment ever applied in CI, so an intended
+size change could not be landed at all.
 
 ## Relationship to the test-suite type-check
 
 `tsconfig.test.json` type-checks `test/` against the library's public types, and
 [#750](https://github.com/FirebaseExtended/reactfire/pull/750) added guards there
-naming the `ObservableStatus` regression directly. That is the better tool for
-the cases it covers, and it is not duplicated here.
+naming the `ObservableStatus` regression directly. That covers the type side from
+source, and nothing here duplicates it.
 
-The two answer different questions. The test-suite check asserts that documented
-consumer usage still compiles, from source, for the patterns someone wrote a test
-for. This gate inventories the type surface **in the packed tarball**, whether or
-not a test exercises it. Both regressions that shipped were invisible to source-
-level checks: the artifact regressed while the source was fine. The remaining
-four checks have no test-suite equivalent at all.
+Neither reaches what these checks do. Both regressions that shipped were
+invisible to source-level checking, because the source was fine and only the
+emitted artifact regressed: a source type-check cannot see that the ESM bundle
+acquired a `require` call, and the test suite never loads the packed tarball at
+all. These four checks have no test-suite equivalent.
 
 ## Entry-point load test
 
@@ -223,16 +202,20 @@ for is present in 4.2.5, the package just does not run.
 
 ## Not covered
 
-Item 7 of [#765](https://github.com/FirebaseExtended/reactfire/issues/765) is not
-implemented:
+**Item 6 of [#765](https://github.com/FirebaseExtended/reactfire/issues/765),**
+the published `.d.ts` diff, which that issue notes is tracked in
+[#749](https://github.com/FirebaseExtended/reactfire/issues/749). It lands
+separately, with the check that classifies a type change as additive or
+breaking, so that the diff and its interpretation arrive together.
 
-- **Runtime smoke render in CI** against a Next App Router and a Vite app,
-  rendering a data hook against the packed build.
+**Item 7 of [#765](https://github.com/FirebaseExtended/reactfire/issues/765),**
+a runtime smoke render in CI against a Next App Router and a Vite app, rendering
+a data hook against the packed build.
 
-Its original justification was being the only check that catches a runtime
-regression by observing it. The entry-load test above now does that for the
-#759 class, so item 7's remaining unique value is narrower: failures that appear
-only in a browser or bundler context and not on a Node import. Worth re-scoping
-against roughly a day of work plus permanent CI minutes and flake surface.
+Item 7's original justification was being the only check that catches a runtime
+regression by observing it. The entry-load test above now does that for the #759
+class, so its remaining unique value is narrower: failures that appear only in a
+browser or bundler context and not on a Node import. Worth re-scoping against
+roughly a day of work plus permanent CI minutes and flake surface.
 
-Neither is required to close the two holes that actually shipped.
+Neither is required to close the runtime hole that actually shipped.

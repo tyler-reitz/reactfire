@@ -9,38 +9,36 @@
  *   1. no CJS interop / dynamic `require` in the ESM entry      (issue #765, item 1)
  *   2. externals stay external, nothing unexpected is inlined   (issue #765, item 2)
  *   3. every path in `exports`/`main`/`module`/`typings` exists  (issue #765, item 4)
- *   4. emitted `.d.ts` match the last published release          (issue #749)
- *   5. bundle size stays within tolerance of it                  (issue #765, item 5)
+ *   4. bundle size stays within tolerance of the published one  (issue #765, item 5)
+ *
+ * This file covers the *runtime* half of the release checks: does the built
+ * artifact still work. The *type* half, diffing the emitted `.d.ts` against the
+ * published release and applying semver to it, is #749 and lives separately,
+ * because it needs `typescript` and keeping it out is what lets this file run
+ * with node builtins alone.
  *
  * Usage:
  *   node scripts/release-gate.mjs [tarball]   verify (packs one if not given)
  *   node scripts/release-gate.mjs --accept    record an acknowledgment
  *
- * Checks 4 and 5 compare against the tarball currently on npm, which is what
- * #749 specifies. Comparing against a copy checked into the repo would drift the
- * moment a release is published without refreshing it, and reactfire is
- * published by hand, so that path is live. The release compared against is the
- * newest one sharing the candidate's major, not the `latest` dist-tag; see
- * `compareSpec`.
+ * Check 4 compares against the tarball currently on npm. Comparing against a
+ * copy checked into the repo would drift the moment a release is published
+ * without refreshing it, and reactfire is published by hand, so that path is
+ * live. The release compared against is the newest one sharing the candidate's
+ * major, not the `latest` dist-tag; see `compareSpec`.
  *
- * Because there is no checked-in copy to diff against, the acknowledgment is a
- * fingerprint: `release-gate/accepted.json` records a digest of the type surface
- * and the npm version it was taken against. A type change fails the gate until
- * someone runs `npm run gate:accept` and commits that file, so the semver call
- * still has to be made at pull-request time and still shows up in review. The
- * file is a few lines rather than a mirrored copy of every `.d.ts`, so there is
- * no second type surface to maintain.
- *
- * An acknowledgment is scoped to the version it was taken against. When a new
- * release lands on npm, a stale acknowledgment stops matching and has to be
- * retaken, so it cannot silently bless a later change.
+ * Size is the one check with no way to tell an intended change from a
+ * regression, so it carries an acknowledgment: `release-gate/accepted.json`
+ * records the measured sizes and the npm version they were taken against,
+ * written by `npm run gate:accept` and committed with the change it covers. It
+ * is scoped to that version, so a new release expires it rather than letting it
+ * silently bless a later change.
  *
  * The exported helpers below are covered by test/release-gate.test.mjs. A gate
  * that silently stops gating is worse than no gate, so the detection logic is
  * pinned by tests rather than by having been checked by hand once.
  */
 
-import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
@@ -190,12 +188,12 @@ export function isNoSuchVersion(stderr) {
  * major.
  *
  * Not the `latest` dist-tag, which breaks the entire v4 line the moment 5.0.0
- * takes that tag. Every v4 candidate then reads as a release candidate that is
- * not a bump (`isMinorOrMajorBump('4.2.7', '5.0.0')` is false, because a lower
- * major can never register as one), so maintenance releases, minors, and even
- * stamped canary builds all fail against a surface from a different major line.
- * The blast radius is every v4 pull request, not just release cuts. Deriving the
- * target from the candidate keeps a v4 build comparing against v4.
+ * takes that tag. A 4.2.7 compared against 5.0.0 is a different version but not
+ * an increase, because a lower major can never register as a bump, so every v4
+ * maintenance release, minor, and stamped canary build would be measured against
+ * an artifact from a different major line. The blast radius is every v4 pull
+ * request, not just release cuts. Deriving the target from the candidate keeps a
+ * v4 build comparing against v4.
  *
  * Derived rather than read from a per-branch dist-tag on purpose. A `v4` tag
  * would have to be maintained correctly on every publish, and reactfire is
@@ -246,9 +244,9 @@ function packPublished(dir, spec, { name, attempts, backoffMs, run }) {
  *
  * Targets the candidate's own major (see `compareSpec`), falling back to the
  * `latest` dist-tag when that major has nothing published. The fallback is what
- * covers the v5 line before 5.0.0 ships: comparing a v5 build against the v4
- * surface is not meaningful for classification, but it is better than not
- * running the checks at all, and the version rule reads a major bump correctly.
+ * covers the v5 line before 5.0.0 ships: a v5 build measured against the v4
+ * artifact is a weak comparison, but it is better than not running the checks at
+ * all, and a genuine size regression still shows up against either baseline.
  *
  * The failure modes are deliberately not treated alike. "Never published" is a
  * legitimate skip: at bootstrap there is genuinely nothing to compare against.
@@ -258,7 +256,10 @@ function packPublished(dir, spec, { name, attempts, backoffMs, run }) {
  * and the job is re-runnable. Wedging a pull request for a few minutes is a
  * better trade than a gate that quietly stops gating.
  */
-export function fetchPublished(outDir, { candidateVersion, spec, tag = COMPARE_TAG, name = 'reactfire', attempts = 3, backoffMs = 2000, run = execFileSync } = {}) {
+export function fetchPublished(
+  outDir,
+  { candidateVersion, spec, tag = COMPARE_TAG, name = 'reactfire', attempts = 3, backoffMs = 2000, run = execFileSync } = {},
+) {
   const dir = path.join(outDir, 'published');
   fs.mkdirSync(dir, { recursive: true });
 
@@ -314,64 +315,10 @@ export function reportUnavailable(check, published, report) {
   return false;
 }
 
-/**
- * Fingerprint of a type surface: the file list and every file's contents.
- *
- * This is what `release-gate/accepted.json` records instead of a copy of the
- * `.d.ts` files themselves. It is enough to tell "the surface someone reviewed"
- * from "the surface being shipped now", which is all the acknowledgment needs to
- * do, and it keeps the committed artifact to one line.
- */
-export function typesDigest(dir, files = listTypeFiles(dir)) {
-  const hash = createHash('sha256');
-  for (const file of files) {
-    hash.update(file);
-    hash.update('\0');
-    hash.update(fs.readFileSync(path.join(dir, file)));
-    hash.update('\0');
-  }
-  return `sha256:${hash.digest('hex')}`;
-}
-
 /** Parse "1.2.3" (ignoring any prerelease suffix) into [major, minor, patch]. */
 export function parseVersion(version) {
   const match = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version ?? ''));
   return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
-}
-
-/**
- * Whether the candidate is a release being cut, rather than an ordinary build.
- *
- * Not a string comparison against the published version. CI stamps an
- * experimental version into package.json before packing (`4.2.6-exp.a0f4f4c`
- * for published 4.2.6), so `!==` treats every pull-request build as a release
- * candidate, and since the numeric core matches it then reads as a patch bump.
- * That would have failed the first pull request to legitimately change the type
- * surface, with a version error that had nothing to do with the change.
- *
- * Comparing the numeric core instead means a stamped build of the published
- * version is correctly seen as "not a release", while a genuine bump (4.2.7,
- * 4.3.0, and their prereleases) still is.
- */
-export function isReleaseCandidate(candidate, published) {
-  const a = parseVersion(candidate);
-  const b = parseVersion(published);
-  if (!a || !b) return false;
-  return a[0] !== b[0] || a[1] !== b[1] || a[2] !== b[2];
-}
-
-/**
- * Whether `candidate` is more than a patch bump over `published`.
- *
- * Used only to decide whether a release is allowed to carry a type change.
- * Returns null when either version is unparseable, which the caller treats as
- * "cannot tell" rather than as a pass or a fail.
- */
-export function isMinorOrMajorBump(candidate, published) {
-  const a = parseVersion(candidate);
-  const b = parseVersion(published);
-  if (!a || !b) return null;
-  return a[0] > b[0] || (a[0] === b[0] && a[1] > b[1]);
 }
 
 export function readAccepted(file = ACCEPTED_FILE) {
@@ -432,56 +379,6 @@ export function findCjsMarkers(source) {
     });
   }
   return found;
-}
-
-/** Minimal unified-ish diff so a type change is readable in CI logs. */
-export function diffLines(before, after) {
-  const a = before.split('\n');
-  const b = after.split('\n');
-  // LCS table. The .d.ts files are small (hundreds of lines), so this is fine.
-  const lcs = Array.from({ length: a.length + 1 }, () => new Uint32Array(b.length + 1));
-  for (let i = a.length - 1; i >= 0; i--) {
-    for (let j = b.length - 1; j >= 0; j--) {
-      lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
-    }
-  }
-  const out = [];
-  let i = 0;
-  let j = 0;
-  while (i < a.length && j < b.length) {
-    if (a[i] === b[j]) {
-      i++;
-      j++;
-    } else if (lcs[i + 1][j] >= lcs[i][j + 1]) {
-      out.push(`  - ${a[i++]}`);
-    } else {
-      out.push(`  + ${b[j++]}`);
-    }
-  }
-  while (i < a.length) out.push(`  - ${a[i++]}`);
-  while (j < b.length) out.push(`  + ${b[j++]}`);
-  return out.join('\n');
-}
-
-/**
- * List declaration files under `dir`, recursively, as paths relative to `dir`.
- *
- * Recursive because tsconfig emits with `rootDir: ./src`, so a subdirectory of
- * src/ (src/nextjs, pending #739) emits dist/nextjs/*.d.ts. A flat listing would
- * leave that entire type surface silently outside the #749 check.
- */
-export function listTypeFiles(dir, prefix = '') {
-  if (!fs.existsSync(dir)) return [];
-  const out = [];
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) {
-      out.push(...listTypeFiles(path.join(dir, entry.name), rel));
-    } else if (entry.name.endsWith('.d.ts')) {
-      out.push(rel);
-    }
-  }
-  return out.sort();
 }
 
 function measure(file) {
@@ -636,90 +533,6 @@ export function checkExportsMap(pkgDir, pkg, report) {
   }
 }
 
-/**
- * Diff the candidate's emitted `.d.ts` against the published release (#749).
- *
- * A difference is not by itself a failure: adding a hook legitimately changes
- * the type surface. What fails is a difference nobody acknowledged, so the
- * decision "is this additive or breaking, and what bump does it need" has to be
- * made by a person and shows up in review.
- */
-export function checkTypes(pkgDir, pkg, published, report, { acceptedFile = ACCEPTED_FILE } = {}) {
-  const distTypes = path.join(pkgDir, 'dist');
-  const current = listTypeFiles(distTypes);
-
-  if (!published?.version) {
-    reportUnavailable('types', published, report);
-    return;
-  }
-
-  const publishedTypes = path.join(published.pkgDir, 'dist');
-  const baseline = listTypeFiles(publishedTypes);
-
-  const added = current.filter((f) => !baseline.includes(f));
-  const removed = baseline.filter((f) => !current.includes(f));
-  const changed = [];
-  for (const file of current.filter((f) => baseline.includes(f))) {
-    const before = fs.readFileSync(path.join(publishedTypes, file), 'utf8');
-    const after = fs.readFileSync(path.join(distTypes, file), 'utf8');
-    if (before !== after) changed.push({ file, diff: diffLines(before, after) });
-  }
-
-  if (added.length === 0 && removed.length === 0 && changed.length === 0) {
-    report.note(`types: identical to reactfire@${published.version}`);
-    return;
-  }
-
-  const summary = `${changed.length} changed, ${added.length} added, ${removed.length} removed`;
-  const digest = typesDigest(distTypes, current);
-  const accepted = readAccepted(acceptedFile);
-  const acknowledged = accepted?.types === digest && accepted?.against === published.version;
-
-  if (!acknowledged) {
-    const detail = [];
-    if (removed.length > 0) detail.push(`    removed declaration file(s): ${removed.join(', ')}`);
-    if (added.length > 0) detail.push(`    new declaration file(s): ${added.join(', ')}`);
-    for (const { file, diff } of changed) {
-      detail.push(`    --- dist/${file}`, diff);
-    }
-    // A digest recorded against an older release is the stale-acknowledgment
-    // case: say so, because "run gate:accept" reads as a no-op otherwise.
-    if (accepted && accepted.against !== published.version) {
-      detail.push('', `    release-gate/accepted.json was taken against ${accepted.against}, but`, `    ${published.version} is now published. Retake it.`);
-    }
-    detail.push(
-      '',
-      '    The published type surface changed. Decide whether this is additive',
-      '    (patch is fine) or non-additive (needs a minor or major bump plus a',
-      '    changelog note), then run `npm run gate:accept` and commit',
-      '    release-gate/accepted.json in the same pull request. See #749.',
-    );
-    report.fail('types', `emitted .d.ts differ from reactfire@${published.version} (${summary})`, detail.join('\n'));
-    return;
-  }
-
-  report.note(`types: ${summary} vs reactfire@${published.version}, acknowledged in release-gate/accepted.json`);
-
-  // Version rule. During normal development package.json carries the published
-  // version (the bump is its own commit at release time, e.g. 7f93210 "4.2.6"),
-  // so there is nothing to assert. Once it moves, this is a release candidate
-  // and a changed type surface may not ship as a patch, which is exactly how
-  // 4.2.4 broke consumer builds.
-  if (!isReleaseCandidate(pkg.version, published.version)) return;
-  const bumped = isMinorOrMajorBump(pkg.version, published.version);
-  if (bumped === false) {
-    report.fail(
-      'types',
-      `version ${pkg.version} is a patch bump over ${published.version}, but the type surface changed`,
-      [
-        '    A type change cannot ship as a patch: consumers on a caret range',
-        '    pick it up unattended, which is what 4.2.4 did. Cut this as a minor',
-        '    (or major, if it is breaking) and note it in the changelog.',
-      ].join('\n'),
-    );
-  }
-}
-
 /** Measure the tarball and the declared entry points of one extracted package. */
 export function measurePackage(pkgDir, pkg, tarball) {
   // `module` is written "./dist/index.js" and `main` "dist/index.umd.cjs";
@@ -755,9 +568,13 @@ export function sizesMatch(accepted, current) {
 export function checkSize(pkgDir, pkg, tarball, published, report, { acceptedFile = ACCEPTED_FILE, publishedMetrics } = {}) {
   const current = measurePackage(pkgDir, pkg, tarball);
 
+  // Size is now the only check that needs the published package, so it owns
+  // reporting when that could not be fetched. It used to stay quiet here and
+  // rely on `types` having failed the run for the same reason; with `types`
+  // gone, deferring would turn a registry failure into a silent skip, which is
+  // the fail-open this gate was explicitly fixed to avoid.
   if (!published?.version) {
-    // `types` already reported the reason; stay quiet rather than doubling it.
-    if (published?.unavailable?.reason !== 'fetch-failed') report.note('size: no published release to compare against, skipped');
+    reportUnavailable('size', published, report);
     return;
   }
 
@@ -765,9 +582,8 @@ export function checkSize(pkgDir, pkg, tarball, published, report, { acceptedFil
   // hit a precise delta, and the tolerance value itself needs pinning.
   const before = publishedMetrics ?? measurePackage(published.pkgDir, readPackageJson(published.pkgDir), published.tarball);
   const accepted = readAccepted(acceptedFile);
-  // Same acknowledgment as the type surface: an intended size move is recorded
-  // once, against a named published version, and stops applying when that
-  // version moves on.
+  // An intended size move is recorded once, against a named published version,
+  // and stops applying when that version moves on.
   //
   // Matched within the tolerance rather than byte-exactly. `gate:accept` is run
   // locally, but the numbers it records get compared against a CI build, and the
@@ -827,7 +643,6 @@ export function runChecks(pkgDir, pkg, tarball, published, options = {}) {
   checkNoCjsInEsm(pkgDir, pkg, report);
   checkExternals(pkgDir, pkg, report);
   checkExportsMap(pkgDir, pkg, report);
-  checkTypes(pkgDir, pkg, published, report, options);
   checkSize(pkgDir, pkg, tarball, published, report, options);
   return report;
 }
@@ -841,7 +656,6 @@ export function runChecks(pkgDir, pkg, tarball, published, options = {}) {
 export function writeAccepted(pkgDir, pkg, tarball, published, file = ACCEPTED_FILE) {
   const body = {
     against: published.version,
-    types: typesDigest(path.join(pkgDir, 'dist')),
     size: measurePackage(pkgDir, pkg, tarball),
   };
   fs.mkdirSync(path.dirname(file), { recursive: true });

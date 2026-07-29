@@ -10,17 +10,12 @@ import {
   findCjsMarkers,
   isNoSuchVersion,
   isNotPublished,
-  listTypeFiles,
   listEsmFiles,
-  diffLines,
   isAllowedExternal,
-  isMinorOrMajorBump,
-  isReleaseCandidate,
   measurePackage,
   parseVersion,
   runChecks,
   sizesMatch,
-  typesDigest,
   writeAccepted,
 } from '../scripts/release-gate.mjs';
 
@@ -124,49 +119,6 @@ describe('findCjsMarkers', () => {
   });
 });
 
-describe('listTypeFiles', () => {
-  let dir;
-
-  beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-types-'));
-  });
-
-  afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-
-  it('lists declaration files and ignores everything else', () => {
-    fs.writeFileSync(path.join(dir, 'index.d.ts'), '');
-    fs.writeFileSync(path.join(dir, 'index.js'), '');
-    expect(listTypeFiles(dir)).toEqual(['index.d.ts']);
-  });
-
-  // tsconfig emits with rootDir ./src, so src/nextjs (pending #739) would emit
-  // dist/nextjs/*.d.ts. A flat listing left that surface outside the #749 check.
-  it('recurses into subdirectories', () => {
-    fs.mkdirSync(path.join(dir, 'nextjs'));
-    fs.writeFileSync(path.join(dir, 'index.d.ts'), '');
-    fs.writeFileSync(path.join(dir, 'nextjs', 'middleware.d.ts'), '');
-    expect(listTypeFiles(dir)).toEqual(['index.d.ts', 'nextjs/middleware.d.ts']);
-  });
-
-  it('returns nothing for a missing directory', () => {
-    expect(listTypeFiles(path.join(dir, 'nope'))).toEqual([]);
-  });
-});
-
-describe('diffLines', () => {
-  it('marks removed and added lines', () => {
-    const diff = diffLines('a\nb\nc', 'a\nB\nc');
-    expect(diff).toContain('- b');
-    expect(diff).toContain('+ B');
-  });
-
-  it('is empty when the inputs match', () => {
-    expect(diffLines('a\nb', 'a\nb')).toBe('');
-  });
-});
-
 describe('runChecks', () => {
   let dir;
 
@@ -197,10 +149,10 @@ describe('runChecks', () => {
   /**
    * Build a candidate package plus the "published" one it is compared against.
    *
-   * Both sides default to the same contents and the same version, so the types
-   * and size checks are no-ops and each test isolates one behaviour. Versions
-   * matching also means the release-time version rule stays out of the way
-   * unless a test opts into it.
+   * Both sides default to the same contents and the same version, so the size
+   * check is a no-op and each test isolates one behaviour. `types` still writes
+   * declaration files because `exports-map` checks that the path in `typings`
+   * exists; nothing diffs them here.
    */
   const build = ({
     esm,
@@ -221,8 +173,8 @@ describe('runChecks', () => {
     fs.writeFileSync(publishedTarball, 'x'.repeat(1000));
 
     const published = { pkgDir: publishedPkg.pkgDir, tarball: publishedTarball, version: publishedVersion };
-    // Nothing acknowledged by default: a type change has to fail before a test
-    // can prove the acknowledgment is what lets it through.
+    // Nothing acknowledged by default: a size move has to fail before a test can
+    // prove the acknowledgment is what lets it through.
     const acceptedFile = path.join(dir, 'accepted.json');
     return { pkgDir, pkg, tarball, published, options: { acceptedFile } };
   };
@@ -261,20 +213,6 @@ describe('runChecks', () => {
     expect(externals?.message).toContain('rxjs');
   });
 
-  it('fails when the emitted types drift from the published release', () => {
-    const { pkgDir, pkg, tarball, published, options } = build({
-      esm: ESM_CLEAN,
-      types: { ...DEFAULT_TYPES, 'useObservable.d.ts': 'export declare const changed: number;\n' },
-      publishedTypes: { ...DEFAULT_TYPES, 'useObservable.d.ts': 'export declare const original: string;\n' },
-    });
-    const { failures } = runChecks(pkgDir, pkg, tarball, published, options);
-    const types = failures.find((f) => f.check === 'types');
-    expect(types).toBeDefined();
-    expect(types.message).toContain('reactfire@4.2.6');
-    expect(types.detail).toContain('- export declare const original: string;');
-    expect(types.detail).toContain('+ export declare const changed: number;');
-  });
-
   it('fails when a path in the exports map is missing from the package', () => {
     const { pkgDir, pkg, tarball, published, options } = build({ esm: ESM_CLEAN });
     fs.rmSync(path.join(pkgDir, 'dist', 'index.umd.cjs'));
@@ -305,29 +243,6 @@ describe('runChecks', () => {
     pkg.exports['./polyfill'] = { import: 'react' };
     const { failures } = runChecks(pkgDir, pkg, tarball, published, options);
     expect(failures.find((f) => f.check === 'exports-map')).toBeUndefined();
-  });
-
-  // The #739 case: a new entry point emits a new declaration file. The
-  // recursion that finds it is only useful if a new file actually fails.
-  it('fails when a declaration file is added', () => {
-    const { pkgDir, pkg, tarball, published, options } = build({ esm: ESM_CLEAN });
-    fs.mkdirSync(path.join(pkgDir, 'dist', 'nextjs'), { recursive: true });
-    fs.writeFileSync(path.join(pkgDir, 'dist', 'nextjs', 'middleware.d.ts'), 'export declare const mw: string;\n');
-    const { failures } = runChecks(pkgDir, pkg, tarball, published, options);
-    const types = failures.find((f) => f.check === 'types');
-    expect(types?.message).toContain('1 added');
-    expect(types?.detail).toContain('nextjs/middleware.d.ts');
-  });
-
-  it('fails when a declaration file is removed', () => {
-    const { pkgDir, pkg, tarball, published, options } = build({
-      esm: ESM_CLEAN,
-      publishedTypes: { ...DEFAULT_TYPES, 'storage.d.ts': 'export declare const s: string;\n' },
-    });
-    const { failures } = runChecks(pkgDir, pkg, tarball, published, options);
-    const types = failures.find((f) => f.check === 'types');
-    expect(types?.message).toContain('1 removed');
-    expect(types?.detail).toContain('storage.d.ts');
   });
 
   // A CJS inline in a non-entry chunk was previously invisible: both bundle
@@ -462,114 +377,25 @@ describe('runChecks', () => {
     expect(failures.find((f) => f.check === 'size')).toBeDefined();
   });
 
-  // --- acknowledgment (#749) ---------------------------------------------
-
-  const withChangedTypes = (overrides = {}) =>
-    build({
-      esm: ESM_CLEAN,
-      types: { ...DEFAULT_TYPES, 'useObservable.d.ts': 'export declare const changed: number;\n' },
-      publishedTypes: { ...DEFAULT_TYPES, 'useObservable.d.ts': 'export declare const original: string;\n' },
-      ...overrides,
-    });
-
-  it('lets an acknowledged type change through', () => {
-    const built = withChangedTypes();
-    accept(built);
-    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, built.published, built.options);
-    expect(failures).toEqual([]);
-  });
-
-  // The acknowledgment fingerprints the surface it covers, so editing the types
-  // afterwards has to invalidate it. Otherwise one gate:accept would bless every
-  // later change in the same pull request.
-  it('does not let an acknowledgment cover a later type change', () => {
-    const built = withChangedTypes();
-    accept(built);
-    fs.writeFileSync(path.join(built.pkgDir, 'dist', 'useObservable.d.ts'), 'export declare const changedAgain: boolean;\n');
-    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, built.published, built.options);
-    expect(failures.find((f) => f.check === 'types')).toBeDefined();
-  });
-
-  // A new release on npm expires the acknowledgment: what it was reviewed
-  // against is gone, so the call has to be made again.
-  it('rejects an acknowledgment taken against a different published version', () => {
-    const built = withChangedTypes();
-    accept(built);
-    const stale = { ...built.published, version: '4.3.0' };
-    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, stale, built.options);
-    const types = failures.find((f) => f.check === 'types');
-    expect(types?.detail).toContain('was taken against 4.2.6');
-  });
-
-  // --- release-time version rule (#749) ----------------------------------
-
-  // package.json carries the published version during normal development, so
-  // there is no bump to judge and the rule has to stay quiet.
-  it('does not assert a version bump while package.json matches the published version', () => {
-    const built = withChangedTypes();
-    accept(built);
-    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, built.published, built.options);
-    expect(failures).toEqual([]);
-  });
-
-  // This is 4.2.4: a real type change cut as a patch, which is what reddened
-  // consumer builds on an unattended caret upgrade.
-  it('fails a release that ships a type change as a patch bump', () => {
-    const built = withChangedTypes({ version: '4.2.7', publishedVersion: '4.2.6' });
-    accept(built);
-    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, built.published, built.options);
-    expect(failures.find((f) => f.check === 'types')?.message).toContain('patch bump');
-  });
-
-  it('allows a release that ships a type change as a minor bump', () => {
-    const built = withChangedTypes({ version: '4.3.0', publishedVersion: '4.2.6' });
-    accept(built);
-    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, built.published, built.options);
-    expect(failures).toEqual([]);
-  });
-
-  // CI stamps an experimental version into package.json before packing
-  // (`4.2.6-exp.<sha>` while 4.2.6 is published), so a `!==` comparison read
-  // every pull-request build as a release candidate and then, because the
-  // numeric core matches, as a patch bump. That would have failed the first PR
-  // to legitimately change types, with an error about the version.
-  it('does not treat CI’s experimental version stamp as a release', () => {
-    const built = withChangedTypes({ version: '4.2.6-exp.a0f4f4c', publishedVersion: '4.2.6' });
-    accept(built);
-    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, built.published, built.options);
-    expect(failures).toEqual([]);
-  });
-
-  // The stamp must not become a blanket exemption: a prerelease of a real bump
-  // is still a release, and still has to clear the rule.
-  it('still applies the rule to a prerelease of a genuine bump', () => {
-    const patch = withChangedTypes({ version: '4.2.7-exp.a0f4f4c', publishedVersion: '4.2.6' });
-    accept(patch);
-    const patchRun = runChecks(patch.pkgDir, patch.pkg, patch.tarball, patch.published, patch.options);
-    expect(patchRun.failures.find((f) => f.check === 'types')?.message).toContain('patch bump');
-
-    const minor = withChangedTypes({ version: '4.3.0-exp.a0f4f4c', publishedVersion: '4.2.6' });
-    accept(minor);
-    const minorRun = runChecks(minor.pkgDir, minor.pkg, minor.tarball, minor.published, minor.options);
-    expect(minorRun.failures).toEqual([]);
-  });
-
-  it('allows a patch release that does not touch the type surface', () => {
-    const built = build({ esm: ESM_CLEAN, version: '4.2.7', publishedVersion: '4.2.6' });
-    const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, built.published, built.options);
-    expect(failures).toEqual([]);
-  });
-
   // Bootstrap: nothing has ever been published, so there is genuinely nothing
   // to compare against. The bundle checks still run.
-  it('skips the comparison checks when nothing has ever been published', () => {
+  it('skips the size comparison when nothing has ever been published', () => {
     const built = build({ esm: ESM_WITH_INLINED_CJS });
-    const published = { unavailable: { reason: 'not-published', tag: 'latest' } };
+    const published = { unavailable: { reason: 'not-published', spec: '^4' } };
     const { failures, notes } = runChecks(built.pkgDir, built.pkg, built.tarball, published, built.options);
-    expect(failures.find((f) => f.check === 'types')).toBeUndefined();
     expect(failures.find((f) => f.check === 'size')).toBeUndefined();
     expect(failures.find((f) => f.check === 'no-cjs-in-esm')).toBeDefined();
     expect(notes.join('\n')).toContain('no published release');
+  });
+
+  // The v5 line before 5.0.0 ships, if the dist-tag fallback also fails to
+  // resolve. Nothing is being withheld, so it is a skip and not a failure.
+  it('skips the size comparison when nothing matches the major', () => {
+    const built = build({ esm: ESM_CLEAN });
+    const published = { unavailable: { reason: 'no-such-version', spec: '^5' } };
+    const { failures, notes } = runChecks(built.pkgDir, built.pkg, built.tarball, published, built.options);
+    expect(failures).toEqual([]);
+    expect(notes.join('\n')).toContain('nothing published matching ^5');
   });
 
   it('treats a bare null as nothing published', () => {
@@ -578,23 +404,23 @@ describe('runChecks', () => {
     expect(failures).toEqual([]);
   });
 
-  // The fail-open case. A skip is indistinguishable from a pass in the check's
-  // status, so a registry failure that skipped would turn a blip into a
-  // silently ungated release.
+  // The fail-open case, and the reason `size` reports this itself rather than
+  // deferring. A skip is indistinguishable from a pass in the check's status, so
+  // a registry failure that skipped would turn a blip into a silently ungated
+  // release. `types` used to carry this; with `types` gone, leaving `size` quiet
+  // here would have reintroduced the fail-open through a refactor.
   it('fails rather than skips when the published release could not be fetched', () => {
     const built = build({ esm: ESM_CLEAN });
-    const published = { unavailable: { reason: 'fetch-failed', tag: 'latest', attempts: 3, detail: 'ETIMEDOUT' } };
+    const published = { unavailable: { reason: 'fetch-failed', spec: '^4', attempts: 3, detail: 'ETIMEDOUT' } };
     const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, published, built.options);
-    const types = failures.find((f) => f.check === 'types');
-    expect(types?.message).toContain('could not fetch');
-    expect(types?.detail).toContain('ETIMEDOUT');
+    const size = failures.find((f) => f.check === 'size');
+    expect(size?.message).toContain('could not fetch');
+    expect(size?.detail).toContain('ETIMEDOUT');
   });
 
-  // One cause, one failure: `size` cannot run either, but repeating the same
-  // registry error under a second check name just buries the real one.
-  it('reports a failed fetch once, not once per check', () => {
+  it('reports a failed fetch once', () => {
     const built = build({ esm: ESM_CLEAN });
-    const published = { unavailable: { reason: 'fetch-failed', tag: 'latest', attempts: 3, detail: 'ETIMEDOUT' } };
+    const published = { unavailable: { reason: 'fetch-failed', spec: '^4', attempts: 3, detail: 'ETIMEDOUT' } };
     const { failures } = runChecks(built.pkgDir, built.pkg, built.tarball, published, built.options);
     expect(failures.filter((f) => f.message.includes('could not fetch'))).toHaveLength(1);
   });
@@ -788,43 +614,7 @@ describe('isNotPublished', () => {
   });
 });
 
-describe('typesDigest', () => {
-  let dir;
-
-  beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-digest-'));
-  });
-
-  afterEach(() => {
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-
-  it('changes when a declaration changes', () => {
-    fs.writeFileSync(path.join(dir, 'index.d.ts'), 'export declare const a: string;\n');
-    const before = typesDigest(dir);
-    fs.writeFileSync(path.join(dir, 'index.d.ts'), 'export declare const a: number;\n');
-    expect(typesDigest(dir)).not.toBe(before);
-  });
-
-  it('changes when a declaration file is added', () => {
-    fs.writeFileSync(path.join(dir, 'index.d.ts'), 'export declare const a: string;\n');
-    const before = typesDigest(dir);
-    fs.writeFileSync(path.join(dir, 'extra.d.ts'), 'export declare const b: string;\n');
-    expect(typesDigest(dir)).not.toBe(before);
-  });
-
-  // The digest concatenates names and contents, so the separators have to keep
-  // "a.d.ts holding X" apart from "b.d.ts holding Y" when the bytes line up.
-  it('distinguishes the same contents under different file names', () => {
-    fs.writeFileSync(path.join(dir, 'a.d.ts'), 'x');
-    const before = typesDigest(dir);
-    fs.rmSync(path.join(dir, 'a.d.ts'));
-    fs.writeFileSync(path.join(dir, 'b.d.ts'), 'x');
-    expect(typesDigest(dir)).not.toBe(before);
-  });
-});
-
-describe('version comparison', () => {
+describe('parseVersion', () => {
   it('parses a plain version', () => {
     expect(parseVersion('4.2.6')).toEqual([4, 2, 6]);
   });
@@ -833,40 +623,11 @@ describe('version comparison', () => {
     expect(parseVersion('5.0.0-rc.2')).toEqual([5, 0, 0]);
   });
 
+  // `compareSpec` falls back to the dist-tag on null rather than building a
+  // broken spec out of a version it could not read.
   it('returns null for something unparseable', () => {
     expect(parseVersion('not-a-version')).toBeNull();
     expect(parseVersion(undefined)).toBeNull();
-  });
-
-  it('treats a patch bump as not minor-or-major', () => {
-    expect(isMinorOrMajorBump('4.2.7', '4.2.6')).toBe(false);
-  });
-
-  it('treats minor and major bumps as minor-or-major', () => {
-    expect(isMinorOrMajorBump('4.3.0', '4.2.6')).toBe(true);
-    expect(isMinorOrMajorBump('5.0.0', '4.2.6')).toBe(true);
-  });
-
-  // "Cannot tell" is not "fine": the caller must not read null as a pass.
-  it('returns null when either side is unparseable', () => {
-    expect(isMinorOrMajorBump('nope', '4.2.6')).toBeNull();
-    expect(isMinorOrMajorBump('4.3.0', 'nope')).toBeNull();
-  });
-
-  // Why the comparison target is derived from the candidate rather than read
-  // from the `latest` dist-tag. Compared against a higher major, every v4
-  // release reads as "a release, but not a bump", because a lower major can
-  // never register as one. Answering that here rather than teaching these
-  // helpers about version lines: they are asked a question that only makes
-  // sense within one major, so the fix is to not ask it across two.
-  it('cannot recognise a bump against a higher major, which is why the target is derived', () => {
-    for (const candidate of ['4.2.7', '4.3.0', '4.2.6-exp.a0f4f4c']) {
-      expect(isReleaseCandidate(candidate, '5.0.0')).toBe(true);
-      expect(isMinorOrMajorBump(candidate, '5.0.0')).toBe(false);
-    }
-    // Against its own line the same candidates read correctly.
-    expect(isMinorOrMajorBump('4.3.0', '4.2.6')).toBe(true);
-    expect(isReleaseCandidate('4.2.6-exp.a0f4f4c', '4.2.6')).toBe(false);
   });
 });
 
