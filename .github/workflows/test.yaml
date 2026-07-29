@@ -39,6 +39,42 @@ jobs:
             publish.sh
             unpack.sh
           retention-days: 1
+  verify-package:
+    runs-on: ubuntu-latest
+    needs: build
+    name: Verify published package
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - name: Install deps
+        run: npm ci
+      - name: 'Download Artifacts'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      # Off-the-shelf checks on the packed tarball the publish job uploads
+      # verbatim, so these verify the exact bytes that ship.
+      #
+      # publint checks the manifest and file formats; attw checks that the
+      # published types resolve under every module-resolution mode. Both found
+      # real consumer-facing bugs on the first run, neither of which a bespoke
+      # check had noticed.
+      - name: publint
+        run: npx publint reactfire-${{ github.run_id }}/reactfire.tgz
+      # `internal-resolution-error` is ignored because the emitted .d.ts use
+      # extensionless relative imports (16 of them, from 10 source files), which
+      # node16 resolution rejects. That is a real pre-existing bug and its own
+      # fix; ignoring the rule keeps every other resolution check enforcing.
+      - name: attw
+        run: npx attw --pack reactfire-${{ github.run_id }}/reactfire.tgz --ignore-rules internal-resolution-error
+      - name: Bundle size
+        run: npm run size
+
   test:
     runs-on: ubuntu-latest
     needs: build
@@ -105,7 +141,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     name: Publish (NPM)
-    needs: test
+    needs: [test, verify-package]
     if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'release' }}
     steps:
       - name: Setup node
