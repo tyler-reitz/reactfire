@@ -101,10 +101,17 @@ function main() {
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'api-diff-'));
   try {
-    const published = fetchPublished(tmp);
+    // Extracted before fetching, because which published release to compare
+    // against is derived from the candidate's own major. Comparing a v4 build
+    // against whatever holds the `latest` dist-tag breaks the entire v4 line
+    // once 5.0.0 takes it; see `compareSpec` in the release gate.
+    const newDist = extract(tarball, path.join(tmp, 'candidate'));
+    const candidateVersion = JSON.parse(fs.readFileSync(path.join(newDist, '..', 'package.json'), 'utf8')).version;
+
+    const published = fetchPublished(tmp, { candidateVersion });
     if (!published.version) {
       const { reason } = published.unavailable;
-      if (reason === 'not-published') {
+      if (reason === 'not-published' || reason === 'no-such-version') {
         console.log('no published release to compare against, skipped');
         return 0;
       }
@@ -116,15 +123,13 @@ function main() {
       return 1;
     }
 
-    const newDist = extract(tarball, path.join(tmp, 'candidate'));
     const oldDist = path.join(published.pkgDir, 'dist');
     stripTree(newDist);
     stripTree(oldDist);
 
-    const candidateVersion = JSON.parse(fs.readFileSync(path.join(newDist, '..', 'package.json'), 'utf8')).version;
     const result = compare(oldDist, newDist);
 
-    console.log(`api diff: reactfire@${candidateVersion} vs published ${published.version}`);
+    console.log(`api diff: reactfire@${candidateVersion} vs published ${published.version} (npm ${published.spec})`);
     if (base) console.log(`target branch: ${base}`);
     console.log(`\nverdict: ${result.verdict}`);
     if (result.removed.length) console.log(`  removed exports: ${result.removed.join(', ')}`);

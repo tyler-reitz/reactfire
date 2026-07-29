@@ -9,19 +9,19 @@
  *   1. no CJS interop / dynamic `require` in the ESM entry      (issue #765, item 1)
  *   2. externals stay external, nothing unexpected is inlined   (issue #765, item 2)
  *   3. every path in `exports`/`main`/`module`/`typings` exists  (issue #765, item 4)
- *   4. bundle size stays within tolerance of the published one  (issue #765, item 5)
+ *   4. emitted `.d.ts` are diffed against the last published release  (issue #749)
+ *   5. bundle size stays within tolerance of it                  (issue #765, item 5)
  *
- * This file covers the *runtime* half of the release checks: does the built
- * artifact still work. The *type* half, diffing the emitted `.d.ts` against the
- * published release and applying semver to it, is #749 and lives separately,
- * because it needs `typescript` and keeping it out is what lets this file run
- * with node builtins alone.
+ * Check 4 reports what moved and enforces the bump at release time. Whether a
+ * change is *breaking* is answered mechanically by the `Check API compatibility`
+ * job (scripts/api-diff/), which is separate because it needs `typescript`, and
+ * keeping it out is what lets this file run with node builtins alone.
  *
  * Usage:
  *   node scripts/release-gate.mjs [tarball]   verify (packs one if not given)
  *   node scripts/release-gate.mjs --accept    record an acknowledgment
  *
- * Check 4 compares against the tarball currently on npm. Comparing against a
+ * Checks 4 and 5 compare against the tarball currently on npm. Comparing against a
  * copy checked into the repo would drift the moment a release is published
  * without refreshing it, and reactfire is published by hand, so that path is
  * live. The release compared against is the newest one sharing the candidate's
@@ -104,15 +104,26 @@ export const CJS_MARKERS = [
 // inlining; see release-gate/README.md.
 export const SIZE_TOLERANCE = 0.02;
 
-/** Collects failures and informational notes for one run. */
+/**
+ * Collects failures and informational notes for one run.
+ *
+ * `seen` exists so that a cause shared by several checks gets reported once.
+ * Every comparison check fails for the same reason when the published package
+ * cannot be fetched, and printing one registry error under each check name
+ * buries it. Tracked on the report rather than by having one check defer to
+ * another: that coupling is invisible, and deleting the check that happened to
+ * do the reporting turns a hard failure into a silent skip.
+ */
 export function createReport() {
   const failures = [];
   const notes = [];
+  const seen = new Set();
   return {
     failures,
     notes,
     fail: (check, message, detail) => failures.push({ check, message, detail }),
     note: (message) => notes.push(message),
+    first: (cause) => (seen.has(cause) ? false : (seen.add(cause), true)),
   };
 }
 
@@ -300,19 +311,59 @@ export function reportUnavailable(check, published, report) {
     report.note(`${check}: nothing published matching ${info.spec}, skipped`);
     return true;
   }
-  report.fail(
-    check,
-    `could not fetch the published release to compare against (${info.attempts} attempts)`,
-    [
-      info.detail ? `    ${info.detail}` : '',
-      '    This is not a skip: without the published package the check cannot',
-      '    run, and passing here would mean the gate silently stopped gating.',
-      '    Re-run the job; if npm is down this will clear on its own.',
-    ]
-      .filter(Boolean)
-      .join('\n'),
-  );
+  // One registry failure, one report, whichever comparison check reaches it
+  // first. Still returns false either way: the check did not run, and a caller
+  // must not read "already reported" as "fine to continue".
+  if (report.first('fetch-failed')) {
+    report.fail(
+      check,
+      `could not fetch the published release to compare against (${info.attempts} attempts)`,
+      [
+        info.detail ? `    ${info.detail}` : '',
+        '    This is not a skip: without the published package the check cannot',
+        '    run, and passing here would mean the gate silently stopped gating.',
+        '    Re-run the job; if npm is down this will clear on its own.',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    );
+  }
   return false;
+}
+
+/**
+ * Whether the candidate is a release being cut, rather than an ordinary build.
+ *
+ * Not a string comparison against the published version. CI stamps an
+ * experimental version into package.json before packing (`4.2.6-exp.a0f4f4c`
+ * for published 4.2.6), so `!==` treats every pull-request build as a release
+ * candidate, and since the numeric core matches it then reads as a patch bump.
+ * That would have failed the first pull request to legitimately change the type
+ * surface, with a version error that had nothing to do with the change.
+ *
+ * Comparing the numeric core instead means a stamped build of the published
+ * version is correctly seen as "not a release", while a genuine bump (4.2.7,
+ * 4.3.0, and their prereleases) still is.
+ */
+export function isReleaseCandidate(candidate, published) {
+  const a = parseVersion(candidate);
+  const b = parseVersion(published);
+  if (!a || !b) return false;
+  return a[0] !== b[0] || a[1] !== b[1] || a[2] !== b[2];
+}
+
+/**
+ * Whether `candidate` is more than a patch bump over `published`.
+ *
+ * Used only to decide whether a release is allowed to carry a type change.
+ * Returns null when either version is unparseable, which the caller treats as
+ * "cannot tell" rather than as a pass or a fail.
+ */
+export function isMinorOrMajorBump(candidate, published) {
+  const a = parseVersion(candidate);
+  const b = parseVersion(published);
+  if (!a || !b) return null;
+  return a[0] > b[0] || (a[0] === b[0] && a[1] > b[1]);
 }
 
 /** Parse "1.2.3" (ignoring any prerelease suffix) into [major, minor, patch]. */
@@ -364,6 +415,56 @@ export function collectImports(source) {
 
 export function isAllowedExternal(spec) {
   return ALLOWED_EXTERNALS.some((rule) => (typeof rule === 'string' ? rule === spec : rule.test(spec)));
+}
+
+/** Minimal unified-ish diff so a type change is readable in CI logs. */
+export function diffLines(before, after) {
+  const a = before.split('\n');
+  const b = after.split('\n');
+  // LCS table. The .d.ts files are small (hundreds of lines), so this is fine.
+  const lcs = Array.from({ length: a.length + 1 }, () => new Uint32Array(b.length + 1));
+  for (let i = a.length - 1; i >= 0; i--) {
+    for (let j = b.length - 1; j >= 0; j--) {
+      lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+    }
+  }
+  const out = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      i++;
+      j++;
+    } else if (lcs[i + 1][j] >= lcs[i][j + 1]) {
+      out.push(`  - ${a[i++]}`);
+    } else {
+      out.push(`  + ${b[j++]}`);
+    }
+  }
+  while (i < a.length) out.push(`  - ${a[i++]}`);
+  while (j < b.length) out.push(`  + ${b[j++]}`);
+  return out.join('\n');
+}
+
+/**
+ * List declaration files under `dir`, recursively, as paths relative to `dir`.
+ *
+ * Recursive because tsconfig emits with `rootDir: ./src`, so a subdirectory of
+ * src/ (src/nextjs, pending #739) emits dist/nextjs/*.d.ts. A flat listing would
+ * leave that entire type surface silently outside the #749 check.
+ */
+export function listTypeFiles(dir, prefix = '') {
+  if (!fs.existsSync(dir)) return [];
+  const out = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      out.push(...listTypeFiles(path.join(dir, entry.name), rel));
+    } else if (entry.name.endsWith('.d.ts')) {
+      out.push(rel);
+    }
+  }
+  return out.sort();
 }
 
 /** Find CJS-interop markers in an ESM bundle. Returns one entry per marker hit. */
@@ -533,6 +634,93 @@ export function checkExportsMap(pkgDir, pkg, report) {
   }
 }
 
+/**
+ * Diff the candidate's emitted `.d.ts` against the published release (#749).
+ *
+ * A difference is not by itself a failure: adding a hook legitimately changes
+ * the type surface. Reporting it is still the point, because it answers "did
+ * anything change", which is what decides whether a release needs at least a
+ * minor. Whether the change is *breaking* is answered mechanically by the
+ * `Check API compatibility` job, so it is deliberately not asked here.
+ *
+ * The two compose rather than overlap, and neither subsumes the other: adding
+ * an optional property to an existing interface is invisible to assignability
+ * (that job reports NO CHANGE) but is still a semver minor, which only this
+ * textual diff can see.
+ *
+ * This check used to fail until someone ran `npm run gate:accept` and committed
+ * a digest of the surface. That ritual existed to force a human to make the
+ * additive-against-breaking call; now that the call is made mechanically, it
+ * bought a signature rather than a decision, at the cost of turning CI red on
+ * changes as small as a JSDoc edit and expiring every open pull request's
+ * acknowledgment whenever a release shipped.
+ */
+export function checkTypes(pkgDir, pkg, published, report) {
+  const distTypes = path.join(pkgDir, 'dist');
+  const current = listTypeFiles(distTypes);
+
+  if (!published?.version) {
+    reportUnavailable('types', published, report);
+    return;
+  }
+
+  const publishedTypes = path.join(published.pkgDir, 'dist');
+  const baseline = listTypeFiles(publishedTypes);
+
+  const added = current.filter((f) => !baseline.includes(f));
+  const removed = baseline.filter((f) => !current.includes(f));
+  const changed = [];
+  for (const file of current.filter((f) => baseline.includes(f))) {
+    const before = fs.readFileSync(path.join(publishedTypes, file), 'utf8');
+    const after = fs.readFileSync(path.join(distTypes, file), 'utf8');
+    if (before !== after) changed.push({ file, diff: diffLines(before, after) });
+  }
+
+  if (added.length === 0 && removed.length === 0 && changed.length === 0) {
+    report.note(`types: identical to reactfire@${published.version}`);
+    return;
+  }
+
+  const summary = `${changed.length} changed, ${added.length} added, ${removed.length} removed`;
+
+  // Printed in full rather than summarized. With the acknowledgment gone this is
+  // the only place the change itself is visible to a reviewer, and the job log
+  // is where they will look.
+  const detail = [];
+  if (removed.length > 0) detail.push(`    removed declaration file(s): ${removed.join(', ')}`);
+  if (added.length > 0) detail.push(`    new declaration file(s): ${added.join(', ')}`);
+  for (const { file, diff } of changed) {
+    detail.push(`    --- dist/${file}`, diff);
+  }
+  report.note([`types: ${summary} vs reactfire@${published.version}`, ...detail].join('\n'));
+
+  // Version rule. During normal development package.json carries the published
+  // version (the bump is its own commit at release time, e.g. 7f93210 "4.2.6"),
+  // so there is nothing to assert. Once it moves, this is a release candidate
+  // and a changed type surface may not ship as a patch, which is exactly how
+  // 4.2.4 broke consumer builds.
+  //
+  // Any textual difference counts, including a comment-only one. That is
+  // conservative in the wrong direction (a docstring edit in a release commit
+  // will ask for a minor), and gating this on the API job's verdict would fix
+  // it, but only by making the gate depend on typescript. Being occasionally
+  // too strict about a bump is the cheaper error.
+  if (!isReleaseCandidate(pkg.version, published.version)) return;
+  const bumped = isMinorOrMajorBump(pkg.version, published.version);
+  if (bumped === false) {
+    report.fail(
+      'types',
+      `version ${pkg.version} is a patch bump over ${published.version}, but the type surface changed`,
+      [
+        '    A type change cannot ship as a patch: consumers on a caret range',
+        '    pick it up unattended, which is what 4.2.4 did. Cut this as a minor',
+        '    (or major, if it is breaking) and note it in the changelog. The',
+        '    `Check API compatibility` job says which of the two this is.',
+      ].join('\n'),
+    );
+  }
+}
+
 /** Measure the tarball and the declared entry points of one extracted package. */
 export function measurePackage(pkgDir, pkg, tarball) {
   // `module` is written "./dist/index.js" and `main` "dist/index.umd.cjs";
@@ -568,11 +756,12 @@ export function sizesMatch(accepted, current) {
 export function checkSize(pkgDir, pkg, tarball, published, report, { acceptedFile = ACCEPTED_FILE, publishedMetrics } = {}) {
   const current = measurePackage(pkgDir, pkg, tarball);
 
-  // Size is now the only check that needs the published package, so it owns
-  // reporting when that could not be fetched. It used to stay quiet here and
-  // rely on `types` having failed the run for the same reason; with `types`
-  // gone, deferring would turn a registry failure into a silent skip, which is
-  // the fail-open this gate was explicitly fixed to avoid.
+  // Reports unconditionally rather than deferring to `types`, which also needs
+  // the published package. `reportUnavailable` dedupes, so the error still
+  // appears once; the point is that neither check depends on the other having
+  // run. An earlier version stayed quiet here and relied on `types` failing for
+  // the same reason, which meant removing `types` silently turned a registry
+  // failure into a skip.
   if (!published?.version) {
     reportUnavailable('size', published, report);
     return;
@@ -643,6 +832,7 @@ export function runChecks(pkgDir, pkg, tarball, published, options = {}) {
   checkNoCjsInEsm(pkgDir, pkg, report);
   checkExternals(pkgDir, pkg, report);
   checkExportsMap(pkgDir, pkg, report);
+  checkTypes(pkgDir, pkg, published, report);
   checkSize(pkgDir, pkg, tarball, published, report, options);
   return report;
 }
