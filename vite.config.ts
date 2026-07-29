@@ -53,6 +53,14 @@ export default defineConfig({
     globals: true,
     environment: 'jsdom',
     setupFiles: './test/setupTests.ts',
+    // Type-level regression guards for the public surface (#749). Runs with
+    // `npm run test:types`, needs no emulators, and is checked by tsc rather
+    // than executed.
+    typecheck: {
+      enabled: false,
+      include: ['test/**/*.test-d.ts'],
+      tsconfig: './tsconfig.test.json',
+    },
   },
   define: {
     // replace `process.env.REACTFIRE_VERSION` in the source

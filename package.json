@@ -33,7 +33,8 @@
     "size": "size-limit",
     "analyze": "size-limit --why",
     "docs": "typedoc --options typedoc.json && markdown-toc -i docs/use.md",
-    "docs:fork": "typedoc --options typedoc.json --gitRemote upstream && markdown-toc -i docs/use.md"
+    "docs:fork": "typedoc --options typedoc.json --gitRemote upstream && markdown-toc -i docs/use.md",
+    "test:types": "vitest --run --typecheck --typecheck.only"
   },
   "peerDependencies": {
     "firebase": "^9.0.0 || ^10.0.0 || ^11.0.0 || ^12.0.0 || next",
