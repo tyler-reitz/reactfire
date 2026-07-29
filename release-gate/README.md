@@ -10,16 +10,40 @@ only node builtins plus `tar` and `npm pack`, so the CI job needs no `npm ci` an
 cannot itself be broken by a dependency change.
 
 The `types` and `size` checks compare against the release currently on npm, which
-the gate downloads with `npm pack reactfire@latest`. That is what
+the gate downloads with `npm pack`. That is what
 [#749](https://github.com/FirebaseExtended/reactfire/issues/749) specifies, and
 it cannot drift: a copy checked into the repo goes stale the moment a release is
 published without refreshing it, and reactfire is published by hand. The bundle
 checks need no network and always run.
 
-The two ways that download can fail are treated differently, on purpose:
+### Which release it compares against
+
+The newest published release **sharing the candidate's major** (`reactfire@^4`
+for a 4.x build), not the `latest` dist-tag.
+
+Using `latest` breaks the entire v4 line the moment 5.0.0 takes that tag. Every
+v4 candidate then reads as a release that is not a bump, because a lower major
+can never register as one, so maintenance releases, minors, and even the stamped
+canary builds CI produces would all fail against a type surface from a different
+major line. That is every v4 pull request, not just release cuts.
+
+Derived from the candidate rather than read from a per-branch dist-tag on
+purpose: a `v4` tag would have to be maintained correctly on every publish, and
+reactfire is published by hand, so it would drift. Same reasoning that ruled out
+a committed baseline.
+
+When the candidate's major has nothing published yet (the `v5` line before 5.0.0
+ships), the gate falls back to `latest` and says so. Comparing a v5 build against
+the v4 surface is not meaningful, but it is better than skipping the checks
+outright, and the version rule still reads a major bump correctly.
+
+The ways that download can fail are treated differently, on purpose:
 
 - **Nothing published yet** is a legitimate skip. At bootstrap there is
   genuinely nothing to compare against.
+- **Nothing matching this major** is the new-major case above, and falls back
+  rather than skipping. npm reports it as `ETARGET`, distinct from the `E404` it
+  returns for a package that does not exist at all.
 - **The fetch failed** is a failure, after three attempts with backoff. Skipping
   would be indistinguishable from passing in the check's status, so a registry
   blip would quietly produce an ungated release. Re-run the job instead; if npm

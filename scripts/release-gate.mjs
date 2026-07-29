@@ -16,10 +16,12 @@
  *   node scripts/release-gate.mjs [tarball]   verify (packs one if not given)
  *   node scripts/release-gate.mjs --accept    record an acknowledgment
  *
- * Checks 4 and 5 compare against the tarball currently on npm (`npm pack
- * reactfire@latest`), which is what #749 specifies. Comparing against a copy
- * checked into the repo would drift the moment a release is published without
- * refreshing it, and reactfire is published by hand, so that path is live.
+ * Checks 4 and 5 compare against the tarball currently on npm, which is what
+ * #749 specifies. Comparing against a copy checked into the repo would drift the
+ * moment a release is published without refreshing it, and reactfire is
+ * published by hand, so that path is live. The release compared against is the
+ * newest one sharing the candidate's major, not the `latest` dist-tag; see
+ * `compareSpec`.
  *
  * Because there is no checked-in copy to diff against, the acknowledgment is a
  * fingerprint: `release-gate/accepted.json` records a digest of the type surface
@@ -49,8 +51,9 @@ import path from 'node:path';
 const ROOT = path.resolve(import.meta.dirname, '..');
 const ACCEPTED_FILE = path.join(ROOT, 'release-gate', 'accepted.json');
 
-// The dist-tag the gate compares against. `latest` is what an unpinned consumer
-// upgrade resolves to, which is the population #749 is about.
+// Fallback comparison target, used only when the candidate's own major has
+// nothing published yet. `latest` is what an unpinned consumer upgrade resolves
+// to, which is the population #749 is about.
 export const COMPARE_TAG = 'latest';
 
 // Bare specifiers the ESM build is allowed to leave as runtime imports.
@@ -166,9 +169,42 @@ function extract(tarball, outDir) {
   return path.join(outDir, 'package');
 }
 
-/** Whether an `npm pack` failure means "no such published version". */
+/** Whether an `npm pack` failure means the package itself has never been published. */
 export function isNotPublished(stderr) {
   return /\bE404\b|404 Not Found|is not in this registry/i.test(String(stderr ?? ''));
+}
+
+/**
+ * Whether an `npm pack` failure means "the package exists, but nothing matches
+ * this range". npm reports that as ETARGET, distinct from the E404 it returns
+ * for a package that does not exist at all. The two need different handling: no
+ * package is a legitimate skip, whereas no release on this major just means the
+ * comparison has to fall back to another one.
+ */
+export function isNoSuchVersion(stderr) {
+  return /\bETARGET\b|\bnotarget\b|No matching version found/i.test(String(stderr ?? ''));
+}
+
+/**
+ * The npm spec to compare a candidate against: the newest release sharing its
+ * major.
+ *
+ * Not the `latest` dist-tag, which breaks the entire v4 line the moment 5.0.0
+ * takes that tag. Every v4 candidate then reads as a release candidate that is
+ * not a bump (`isMinorOrMajorBump('4.2.7', '5.0.0')` is false, because a lower
+ * major can never register as one), so maintenance releases, minors, and even
+ * stamped canary builds all fail against a surface from a different major line.
+ * The blast radius is every v4 pull request, not just release cuts. Deriving the
+ * target from the candidate keeps a v4 build comparing against v4.
+ *
+ * Derived rather than read from a per-branch dist-tag on purpose. A `v4` tag
+ * would have to be maintained correctly on every publish, and reactfire is
+ * published by hand on a broken CI/CD path, so it would drift. That is the same
+ * reasoning that ruled out a committed baseline.
+ */
+export function compareSpec(candidateVersion) {
+  const parsed = parseVersion(candidateVersion);
+  return parsed ? `^${parsed[0]}` : COMPARE_TAG;
 }
 
 /** Block the current thread. Used for retry backoff; the gate is synchronous. */
@@ -176,28 +212,12 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/**
- * Download the currently published tarball and extract it.
- *
- * Returns `{ pkgDir, tarball, version }` on success, or `{ unavailable }`
- * describing why not.
- *
- * The two failure modes are deliberately not the same. "Never published" is a
- * legitimate skip: at bootstrap there is genuinely nothing to compare against.
- * A failed fetch is not, because a skip is indistinguishable from a pass in the
- * check's status, which would turn a registry blip into a silently ungated
- * release. So transient failures are retried and then reported as a failure,
- * and the job is re-runnable. Wedging a pull request for a few minutes is a
- * better trade than a gate that quietly stops gating.
- */
-export function fetchPublished(outDir, { tag = COMPARE_TAG, name = 'reactfire', attempts = 3, backoffMs = 2000, run = execFileSync } = {}) {
-  const dir = path.join(outDir, 'published');
-  fs.mkdirSync(dir, { recursive: true });
-
+/** One `npm pack <name>@<spec>` with retries. Internal; see `fetchPublished`. */
+function packPublished(dir, spec, { name, attempts, backoffMs, run }) {
   let last = '';
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      const stdout = run('npm', ['pack', `${name}@${tag}`, '--json', '--pack-destination', dir], {
+      const stdout = run('npm', ['pack', `${name}@${spec}`, '--json', '--pack-destination', dir], {
         stdio: ['ignore', 'pipe', 'pipe'],
         encoding: 'utf8',
         maxBuffer: 64 * 1024 * 1024,
@@ -206,15 +226,59 @@ export function fetchPublished(outDir, { tag = COMPARE_TAG, name = 'reactfire', 
       const entry = Array.isArray(report) ? report[0] : Object.values(report)[0];
       const tarball = path.join(dir, entry.filename);
       const pkgDir = extract(tarball, dir);
-      return { pkgDir, tarball, version: readPackageJson(pkgDir).version };
+      return { pkgDir, tarball, version: readPackageJson(pkgDir).version, spec };
     } catch (error) {
       last = String(error.stderr ?? error.message ?? '');
-      // A missing package will still be missing on the next attempt.
-      if (isNotPublished(last)) return { unavailable: { reason: 'not-published', tag, detail: last.trim().split('\n')[0] ?? '' } };
+      // Neither a missing package nor an unsatisfiable range improves on a retry.
+      if (isNotPublished(last)) return { unavailable: { reason: 'not-published', spec, detail: last.trim().split('\n')[0] ?? '' } };
+      if (isNoSuchVersion(last)) return { unavailable: { reason: 'no-such-version', spec, detail: last.trim().split('\n')[0] ?? '' } };
       if (attempt < attempts) sleepSync(backoffMs * attempt);
     }
   }
-  return { unavailable: { reason: 'fetch-failed', tag, attempts, detail: last.trim().split('\n').slice(-1)[0] ?? '' } };
+  return { unavailable: { reason: 'fetch-failed', spec, attempts, detail: last.trim().split('\n').slice(-1)[0] ?? '' } };
+}
+
+/**
+ * Download the published tarball to compare against, and extract it.
+ *
+ * Returns `{ pkgDir, tarball, version, spec }` on success, or `{ unavailable }`
+ * describing why not.
+ *
+ * Targets the candidate's own major (see `compareSpec`), falling back to the
+ * `latest` dist-tag when that major has nothing published. The fallback is what
+ * covers the v5 line before 5.0.0 ships: comparing a v5 build against the v4
+ * surface is not meaningful for classification, but it is better than not
+ * running the checks at all, and the version rule reads a major bump correctly.
+ *
+ * The failure modes are deliberately not treated alike. "Never published" is a
+ * legitimate skip: at bootstrap there is genuinely nothing to compare against.
+ * A failed fetch is not, because a skip is indistinguishable from a pass in the
+ * check's status, which would turn a registry blip into a silently ungated
+ * release. So transient failures are retried and then reported as a failure,
+ * and the job is re-runnable. Wedging a pull request for a few minutes is a
+ * better trade than a gate that quietly stops gating.
+ */
+export function fetchPublished(outDir, { candidateVersion, spec, tag = COMPARE_TAG, name = 'reactfire', attempts = 3, backoffMs = 2000, run = execFileSync } = {}) {
+  const dir = path.join(outDir, 'published');
+  fs.mkdirSync(dir, { recursive: true });
+
+  // Deliberately not defaulted. Falling back to `latest` when the caller forgets
+  // to say what it is comparing reinstates exactly the bug `compareSpec` exists
+  // to fix, and does it silently. A caller that genuinely wants the dist-tag
+  // passes `spec` and says so.
+  if (!spec && !candidateVersion) throw new TypeError('fetchPublished needs candidateVersion (or an explicit spec) to pick a comparison target');
+
+  const primary = spec ?? compareSpec(candidateVersion);
+  const opts = { name, attempts, backoffMs, run };
+  const result = packPublished(dir, primary, opts);
+
+  // Nothing on this major yet. The package itself is published, so this is the
+  // new-major case rather than bootstrap; fall back rather than skip.
+  if (result.unavailable?.reason === 'no-such-version' && primary !== tag) {
+    const fallback = packPublished(dir, tag, opts);
+    return fallback.version ? { ...fallback, fellBackFrom: primary } : fallback;
+  }
+  return result;
 }
 
 /**
@@ -226,6 +290,13 @@ export function reportUnavailable(check, published, report) {
   const info = published?.unavailable ?? { reason: 'not-published' };
   if (info.reason === 'not-published') {
     report.note(`${check}: no published release to compare against, skipped`);
+    return true;
+  }
+  // Only reachable when the fallback dist-tag itself does not resolve, since a
+  // major with no releases falls back to it. Still a skip rather than a failure:
+  // there is no artifact to compare against, and none is being withheld.
+  if (info.reason === 'no-such-version') {
+    report.note(`${check}: nothing published matching ${info.spec}, skipped`);
     return true;
   }
   report.fail(
@@ -804,12 +875,12 @@ function main() {
     const tarball = tarballArg ? path.resolve(tarballArg) : pack(tmp);
     const pkgDir = extract(tarball, tmp);
     const pkg = readPackageJson(pkgDir);
-    const published = fetchPublished(tmp);
+    const published = fetchPublished(tmp, { candidateVersion: pkg.version });
 
     console.log(`release gate: reactfire@${pkg.version} (${path.basename(tarball)})`);
     console.log(
       published.version
-        ? `comparing against reactfire@${published.version} (npm ${COMPARE_TAG})\n`
+        ? `comparing against reactfire@${published.version} (npm ${published.spec})${published.fellBackFrom ? `, nothing published matching ${published.fellBackFrom}` : ''}\n`
         : `no published release available (${published.unavailable.reason})\n`,
     );
 

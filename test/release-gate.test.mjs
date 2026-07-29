@@ -3,9 +3,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
+  COMPARE_TAG,
   collectImports,
+  compareSpec,
   fetchPublished,
   findCjsMarkers,
+  isNoSuchVersion,
   isNotPublished,
   listTypeFiles,
   listEsmFiles,
@@ -614,13 +617,28 @@ describe('fetchPublished', () => {
     throw error;
   };
 
+  const ETARGET = 'npm error code ETARGET\nnpm error notarget No matching version found for reactfire@^5.';
+
+  /** Stand in for a real pack: write the tarball the call claims to have made. */
+  const packOk = (version) => (cmd, args) => {
+    const dest = args[args.indexOf('--pack-destination') + 1];
+    const pkgDir = path.join(dest, 'package');
+    fs.mkdirSync(pkgDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: 'reactfire', version }));
+    execFileSync('tar', ['-czf', path.join(dest, `reactfire-${version}.tgz`), '-C', dest, 'package']);
+    return JSON.stringify([{ filename: `reactfire-${version}.tgz` }]);
+  };
+
+  /** The `name@spec` argument each call asked npm for. */
+  const specsFrom = (calls) => calls.map((args) => args[1]);
+
   it('classifies a 404 as never published and does not retry it', () => {
     let calls = 0;
     const run = (...args) => {
       calls++;
       return failWith('npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/reactfire')(...args);
     };
-    const result = fetchPublished(dir, { run, attempts: 3, backoffMs: 0 });
+    const result = fetchPublished(dir, { candidateVersion: '4.2.6', run, attempts: 3, backoffMs: 0 });
     expect(result.unavailable.reason).toBe('not-published');
     // Retrying a missing package just spends CI time to get the same answer.
     expect(calls).toBe(1);
@@ -632,28 +650,128 @@ describe('fetchPublished', () => {
       calls++;
       return failWith('npm error network request to https://registry.npmjs.org/reactfire failed, reason: ETIMEDOUT')(...args);
     };
-    const result = fetchPublished(dir, { run, attempts: 3, backoffMs: 0 });
+    const result = fetchPublished(dir, { candidateVersion: '4.2.6', run, attempts: 3, backoffMs: 0 });
     expect(result.unavailable.reason).toBe('fetch-failed');
     expect(result.unavailable.attempts).toBe(3);
     expect(calls).toBe(3);
   });
 
   it('succeeds if a retry succeeds', () => {
-    // Stand in for a real pack: write the tarball the second call claims to.
     let calls = 0;
     const run = (cmd, args) => {
       calls++;
       if (calls === 1) return failWith('ETIMEDOUT')();
-      const dest = args[args.indexOf('--pack-destination') + 1];
-      const pkgDir = path.join(dest, 'package');
-      fs.mkdirSync(pkgDir, { recursive: true });
-      fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: 'reactfire', version: '4.2.6' }));
-      execFileSync('tar', ['-czf', path.join(dest, 'reactfire-4.2.6.tgz'), '-C', dest, 'package']);
-      return JSON.stringify([{ filename: 'reactfire-4.2.6.tgz' }]);
+      return packOk('4.2.6')(cmd, args);
     };
-    const result = fetchPublished(dir, { run, attempts: 3, backoffMs: 0 });
+    const result = fetchPublished(dir, { candidateVersion: '4.2.6', run, attempts: 3, backoffMs: 0 });
     expect(result.version).toBe('4.2.6');
     expect(calls).toBe(2);
+  });
+
+  // --- comparison target ---------------------------------------------------
+
+  // The v5 regression, stated as the request that is actually made. Asking for
+  // `latest` breaks the whole v4 line the moment 5.0.0 holds that tag: every v4
+  // candidate then reads as a release that is not a bump, because a lower major
+  // can never register as one (see the version-comparison suite).
+  it('asks for the candidate’s own major, not the dist-tag', () => {
+    const calls = [];
+    const run = (cmd, args) => {
+      calls.push(args);
+      return packOk('4.2.6')(cmd, args);
+    };
+    const result = fetchPublished(dir, { candidateVersion: '4.2.7', run, attempts: 1, backoffMs: 0 });
+    expect(specsFrom(calls)).toEqual(['reactfire@^4']);
+    expect(result.version).toBe('4.2.6');
+    expect(result.spec).toBe('^4');
+  });
+
+  it('uses the stamped version’s major, as CI packs it', () => {
+    const calls = [];
+    const run = (cmd, args) => {
+      calls.push(args);
+      return packOk('4.2.6')(cmd, args);
+    };
+    fetchPublished(dir, { candidateVersion: '4.2.6-exp.a0f4f4c', run, attempts: 1, backoffMs: 0 });
+    expect(specsFrom(calls)).toEqual(['reactfire@^4']);
+  });
+
+  // The v5 line before 5.0.0 ships. Comparing against the v4 surface is not
+  // meaningful for classification, but it is better than skipping the checks
+  // outright, and the version rule reads a major bump correctly.
+  it('falls back to the dist-tag when the major has nothing published', () => {
+    const calls = [];
+    const run = (cmd, args) => {
+      calls.push(args);
+      if (calls.length === 1) return failWith(ETARGET)();
+      return packOk('4.2.6')(cmd, args);
+    };
+    const result = fetchPublished(dir, { candidateVersion: '5.0.0', run, attempts: 3, backoffMs: 0 });
+    expect(specsFrom(calls)).toEqual(['reactfire@^5', 'reactfire@latest']);
+    expect(result.version).toBe('4.2.6');
+    expect(result.fellBackFrom).toBe('^5');
+  });
+
+  // ETARGET means the registry answered, so retrying asks a question already
+  // answered. Only the fallback is worth another call.
+  it('does not retry an unsatisfiable range', () => {
+    const calls = [];
+    const run = (cmd, args) => {
+      calls.push(args);
+      return failWith(ETARGET)();
+    };
+    const result = fetchPublished(dir, { candidateVersion: '5.0.0', run, attempts: 3, backoffMs: 0 });
+    expect(specsFrom(calls)).toEqual(['reactfire@^5', 'reactfire@latest']);
+    expect(result.unavailable.reason).toBe('no-such-version');
+  });
+
+  // Defaulting the target would reinstate the bug `compareSpec` exists to fix,
+  // and would do it silently in whichever caller forgot to pass the version.
+  it('refuses to guess a comparison target', () => {
+    expect(() => fetchPublished(dir, { run: packOk('4.2.6'), attempts: 1 })).toThrow(/candidateVersion/);
+  });
+
+  it('honours an explicit spec without needing a candidate version', () => {
+    const calls = [];
+    const run = (cmd, args) => {
+      calls.push(args);
+      return packOk('4.2.6')(cmd, args);
+    };
+    fetchPublished(dir, { spec: 'latest', run, attempts: 1, backoffMs: 0 });
+    expect(specsFrom(calls)).toEqual(['reactfire@latest']);
+  });
+});
+
+describe('compareSpec', () => {
+  it('targets the candidate’s major', () => {
+    expect(compareSpec('4.2.7')).toBe('^4');
+    expect(compareSpec('5.0.0')).toBe('^5');
+  });
+
+  it('ignores a prerelease suffix', () => {
+    expect(compareSpec('4.2.6-exp.a0f4f4c')).toBe('^4');
+  });
+
+  // Nothing sane to derive, so fall back rather than build a broken spec.
+  it('falls back to the dist-tag for an unparseable version', () => {
+    expect(compareSpec(undefined)).toBe(COMPARE_TAG);
+    expect(compareSpec('not-a-version')).toBe(COMPARE_TAG);
+  });
+});
+
+describe('isNoSuchVersion', () => {
+  it('recognises the ETARGET shapes', () => {
+    expect(isNoSuchVersion('npm error code ETARGET')).toBe(true);
+    expect(isNoSuchVersion('npm error notarget No matching version found for reactfire@^5.')).toBe(true);
+  });
+
+  // The two get different handling: no package is a skip, no matching version
+  // falls back. Conflating them would skip the checks on the whole v5 line.
+  it('is distinct from a missing package and from a network error', () => {
+    expect(isNoSuchVersion('npm error code E404')).toBe(false);
+    expect(isNoSuchVersion('request to https://registry.npmjs.org failed, reason: ETIMEDOUT')).toBe(false);
+    expect(isNoSuchVersion(undefined)).toBe(false);
+    expect(isNotPublished('npm error code ETARGET')).toBe(false);
   });
 });
 
@@ -733,6 +851,22 @@ describe('version comparison', () => {
   it('returns null when either side is unparseable', () => {
     expect(isMinorOrMajorBump('nope', '4.2.6')).toBeNull();
     expect(isMinorOrMajorBump('4.3.0', 'nope')).toBeNull();
+  });
+
+  // Why the comparison target is derived from the candidate rather than read
+  // from the `latest` dist-tag. Compared against a higher major, every v4
+  // release reads as "a release, but not a bump", because a lower major can
+  // never register as one. Answering that here rather than teaching these
+  // helpers about version lines: they are asked a question that only makes
+  // sense within one major, so the fix is to not ask it across two.
+  it('cannot recognise a bump against a higher major, which is why the target is derived', () => {
+    for (const candidate of ['4.2.7', '4.3.0', '4.2.6-exp.a0f4f4c']) {
+      expect(isReleaseCandidate(candidate, '5.0.0')).toBe(true);
+      expect(isMinorOrMajorBump(candidate, '5.0.0')).toBe(false);
+    }
+    // Against its own line the same candidates read correctly.
+    expect(isMinorOrMajorBump('4.3.0', '4.2.6')).toBe(true);
+    expect(isReleaseCandidate('4.2.6-exp.a0f4f4c', '4.2.6')).toBe(false);
   });
 });
 
