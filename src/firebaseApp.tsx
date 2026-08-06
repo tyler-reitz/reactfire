@@ -2,6 +2,7 @@ import * as React from 'react';
 import { getApps, initializeApp, registerVersion } from 'firebase/app';
 
 import type { FirebaseApp, FirebaseOptions } from 'firebase/app';
+import { ObservableCacheProvider, getDefaultObservableCache, type ObservableCache } from './observableCache.js';
 
 declare const process: { env: Record<string, string | undefined> };
 
@@ -16,6 +17,12 @@ export interface FirebaseAppProviderProps {
   firebaseConfig?: FirebaseOptions;
   appName?: string;
   suspense?: boolean;
+  /**
+   * The observable cache this tree should use. Create one per request on a server so
+   * concurrent requests do not share subscriptions or data. Defaults to a
+   * process-wide cache, which is what a browser wants.
+   */
+  cache?: ObservableCache;
 }
 
 // REACTFIRE_VERSION is automatically pulled in from `package.json` by Vite
@@ -52,9 +59,13 @@ export function FirebaseAppProvider(props: React.PropsWithChildren<FirebaseAppPr
     }
   }, [props.firebaseApp, firebaseConfig, appName]);
 
+  const cache = props.cache ?? getDefaultObservableCache();
+
   return (
     <FirebaseAppContext.Provider value={firebaseApp}>
-      <SuspenseEnabledContext.Provider value={suspense ?? false} {...props} />
+      <ObservableCacheProvider value={cache}>
+        <SuspenseEnabledContext.Provider value={suspense ?? false} {...props} />
+      </ObservableCacheProvider>
     </FirebaseAppContext.Provider>
   );
 }

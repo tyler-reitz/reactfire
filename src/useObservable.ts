@@ -3,26 +3,20 @@ import { useSyncExternalStore } from 'use-sync-external-store/shim';
 import { Observable } from 'rxjs';
 import { SuspenseSubject } from './SuspenseSubject.js';
 import { useSuspenseEnabledFromConfigAndContext } from './firebaseApp.js';
-import { ReactFireGlobals, ReactFireOptions } from './index.js';
+import { ReactFireOptions } from './index.js';
+import { getDefaultObservableCache, useObservableCache, type ObservableCache } from './observableCache.js';
 
 const DEFAULT_TIMEOUT = 30_000;
-
-// Since we're side-effect free, we need to ensure our observable cache is global
-const preloadedObservables: Map<string, SuspenseSubject<any>> = (globalThis as any as ReactFireGlobals)._reactFirePreloadedObservables || new Map();
-
-if (!(globalThis as any as ReactFireGlobals)._reactFirePreloadedObservables) {
-  (globalThis as any as ReactFireGlobals)._reactFirePreloadedObservables = preloadedObservables;
-}
 
 // Starts listening to an Observable.
 // Call this once you know you're going to render a
 // child that will consume the observable
-export function preloadObservable<T>(source: Observable<T>, id: string, suspenseEnabled = false) {
-  if (preloadedObservables.has(id)) {
-    return preloadedObservables.get(id) as SuspenseSubject<T>;
+export function preloadObservable<T>(source: Observable<T>, id: string, suspenseEnabled = false, cache: ObservableCache = getDefaultObservableCache()) {
+  if (cache.has(id)) {
+    return cache.get(id) as SuspenseSubject<T>;
   } else {
     const observable = new SuspenseSubject(source, DEFAULT_TIMEOUT, suspenseEnabled);
-    preloadedObservables.set(id, observable);
+    cache.set(id, observable);
     return observable;
   }
 }
@@ -71,8 +65,10 @@ export function useObservable<T = unknown>(observableId: string, source: Observa
 
   const suspenseEnabled = useSuspenseEnabledFromConfigAndContext(config.suspense);
 
-  // Register the observable with the cache
-  const observable = preloadObservable(source, observableId, suspenseEnabled);
+  // Register the observable with the cache the surrounding provider supplied,
+  // falling back to the process-wide one.
+  const cache = useObservableCache();
+  const observable = preloadObservable(source, observableId, suspenseEnabled, cache);
 
   // Suspend if suspense is enabled and no initial data exists
   const hasInitialData = config.hasOwnProperty('initialData') || config.hasOwnProperty('startWithValue');
