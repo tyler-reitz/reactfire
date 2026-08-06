@@ -2,6 +2,27 @@
 
 ReactFire v5 contains breaking changes. This section lists them as they land; add an entry here in any PR that changes public behavior.
 
+## `startWithValue` removed
+
+`ReactFireOptions.startWithValue` has been removed. It was deprecated in favor of `initialData` in v3 and does the same thing.
+
+```tsx
+// Before
+useFirestoreDocData(ref, { startWithValue: cachedDoc });
+
+// After
+useFirestoreDocData(ref, { initialData: cachedDoc });
+```
+
+**If you use TypeScript**, passing it is now a compile error, so you will find every call site by building.
+
+**If you use JavaScript, read this.** Nothing would otherwise tell you: the option is simply ignored, and the effect is a behavior change rather than an error.
+
+- Without suspense, the hook now reports `status: 'loading'` until the observable emits, where it previously reported `success` with your seeded value on the first render.
+- With suspense, the component now **suspends** on first render where it previously did not, so you will see a fallback that did not appear before.
+
+Because that is silent, ReactFire logs a one-time console warning naming the `observableId` of each affected call site. The warning will be removed in v6, so treat it as a migration aid rather than a supported state.
+
 ## Error handling behavior change
 
 Previously, errors from any reactfire hook were thrown unconditionally, making `status: 'error'` unreachable in practice. In v5, error handling depends on the mode:

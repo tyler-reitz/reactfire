@@ -10,6 +10,62 @@ import { baseConfig } from './appConfig';
 describe('useObservable', () => {
   afterEach(cleanup);
 
+  describe('startWithValue removal', () => {
+    // A JavaScript caller can still pass the removed option, so these go through a cast to
+    // stand in for one. A TypeScript caller gets a compile error and never reaches here.
+    const asJsCaller = (options: Record<string, unknown>) => options as ReactFireOptions;
+
+    it('warns that startWithValue is ignored', () => {
+      const spy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const observable$: Subject<any> = new Subject();
+
+      renderHook(() => useObservable('swv-warns', observable$, asJsCaller({ suspense: false, startWithValue: 'seed' })));
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy.mock.calls[0][0]).toContain('startWithValue');
+      expect(spy.mock.calls[0][0]).toContain('swv-warns');
+      spy.mockRestore();
+    });
+
+    it('ignores the value rather than seeding from it', () => {
+      const spy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const observable$: Subject<any> = new Subject();
+
+      const { result } = renderHook(() => useObservable('swv-ignored', observable$, asJsCaller({ suspense: false, startWithValue: 'seed' })));
+
+      // Before the removal this was `success` with `seed`. This assertion is the behavior
+      // change itself, so if it ever goes back to passing as `success` the removal regressed.
+      expect(result.current.status).toEqual('loading');
+      expect(result.current.data).toBeUndefined();
+      spy.mockRestore();
+    });
+
+    it('warns once per observableId, not once per render', () => {
+      const spy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const observable$: Subject<any> = new Subject();
+
+      const { rerender } = renderHook(() => useObservable('swv-once', observable$, asJsCaller({ suspense: false, startWithValue: 'seed' })));
+      rerender();
+      rerender();
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      spy.mockRestore();
+    });
+
+    it('does not warn when only initialData is passed', () => {
+      const spy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const observable$: Subject<any> = new Subject();
+
+      renderHook(() => useObservable('swv-clean', observable$, { suspense: false, initialData: 'seed' }));
+
+      // Scoped to this call site's own observableId. Asserting `not.toHaveBeenCalled()`, or even
+      // "no message mentioning startWithValue", makes this test fail when some other test's tree
+      // warns while it runs, which is execution order rather than the behavior being checked.
+      expect(spy).not.toHaveBeenCalledWith(expect.stringContaining('swv-clean'));
+      spy.mockRestore();
+    });
+  });
+
   describe('Non-Suspense Mode', () => {
     it('Reports its status correctly', () => {
       const observable$: Subject<any> = new Subject();
@@ -174,7 +230,7 @@ describe('useObservable', () => {
       // stop a nasty-looking console error
       // https://github.com/facebook/react/issues/11098#issuecomment-523977830
       const spy = vi.spyOn(console, 'error');
-      spy.mockImplementation(() => {});
+      spy.mockImplementation(() => undefined);
 
       // React 18 dispatches a window error event when a component throws during render
       // even when caught by expect().toThrow(). Prevent it from surfacing as an uncaught
@@ -213,7 +269,7 @@ describe('useObservable', () => {
       // stop a nasty-looking console error
       // https://github.com/facebook/react/issues/11098#issuecomment-523977830
       const spy = vi.spyOn(console, 'error');
-      spy.mockImplementation(() => {});
+      spy.mockImplementation(() => undefined);
 
       const error = new Error('I am an error');
       const observable$ = throwError(error);
@@ -369,7 +425,7 @@ describe('useObservable', () => {
     });
     it('throws an error via FirebaseAppProvider suspense context path', () => {
       const spy = vi.spyOn(console, 'error');
-      spy.mockImplementation(() => {});
+      spy.mockImplementation(() => undefined);
 
       const onError = (e: ErrorEvent) => e.preventDefault();
       window.addEventListener('error', onError);

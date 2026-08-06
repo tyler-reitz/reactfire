@@ -7,6 +7,28 @@ import { ReactFireGlobals, ReactFireOptions } from './index.js';
 
 const DEFAULT_TIMEOUT = 30_000;
 
+// `startWithValue` was removed in v5. It had been `@deprecated` in favour of `initialData`
+// since v3 but never warned at runtime, so for a JavaScript caller its removal would
+// otherwise be completely silent: seeding would just stop happening, and in suspense mode
+// the component would begin suspending where it previously did not. TypeScript callers get
+// a compile error instead, which is why this only exists for the ones types cannot reach.
+//
+// Warned once per observableId rather than per render, so a caller sees each affected call
+// site once instead of a message per commit. Delete this in 6.0.
+const warnedStartWithValueIds = new Set<string>();
+
+function warnIfStartWithValue(config: ReactFireOptions, observableId: string) {
+  if (!config.hasOwnProperty('startWithValue') || warnedStartWithValueIds.has(observableId)) {
+    return;
+  }
+
+  warnedStartWithValueIds.add(observableId);
+  console.warn(
+    `ReactFire: "startWithValue" was removed in v5 and is being ignored (observableId: "${observableId}"). ` +
+      'Use "initialData" instead. See docs/upgrade-guide.md.'
+  );
+}
+
 // Since we're side-effect free, we need to ensure our observable cache is global
 const preloadedObservables: Map<string, SuspenseSubject<any>> = (globalThis as any as ReactFireGlobals)._reactFirePreloadedObservables || new Map();
 
@@ -69,13 +91,15 @@ export function useObservable<T = unknown>(observableId: string, source: Observa
     throw new Error('cannot call useObservable without an observableId');
   }
 
+  warnIfStartWithValue(config, observableId);
+
   const suspenseEnabled = useSuspenseEnabledFromConfigAndContext(config.suspense);
 
   // Register the observable with the cache
   const observable = preloadObservable(source, observableId, suspenseEnabled);
 
   // Suspend if suspense is enabled and no initial data exists
-  const hasInitialData = config.hasOwnProperty('initialData') || config.hasOwnProperty('startWithValue');
+  const hasInitialData = config.hasOwnProperty('initialData');
   const hasData = observable.hasValue || hasInitialData;
   if (suspenseEnabled === true && !hasData) {
     throw observable.firstEmission;
@@ -132,7 +156,7 @@ export function useObservable<T = unknown>(observableId: string, source: Observa
   const serverSnapshotRef = React.useRef<ObservableStatus<T> | undefined>(undefined);
   const getServerSnapshot = React.useCallback<() => ObservableStatus<T>>(() => {
     if (serverSnapshotRef.current === undefined) {
-      const initialDataValue = config?.initialData ?? config?.startWithValue;
+      const initialDataValue = config?.initialData;
 
       serverSnapshotRef.current = {
         status: hasInitialData ? 'success' : 'loading',
@@ -145,10 +169,10 @@ export function useObservable<T = unknown>(observableId: string, source: Observa
     }
 
     return serverSnapshotRef.current;
-    // `config.initialData` and `config.startWithValue` are read above but deliberately left
-    // out of the dependency array. Callers routinely pass a fresh `config` literal on every
-    // render, so including them would rebuild this callback constantly, and the ref means
-    // the value is computed once per component instance regardless.
+    // `config.initialData` is read above but deliberately left out of the dependency array.
+    // Callers routinely pass a fresh `config` literal on every render, so including it would
+    // rebuild this callback constantly, and the ref means the value is computed once per
+    // component instance regardless.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [observable, hasInitialData]);
 
@@ -158,7 +182,7 @@ export function useObservable<T = unknown>(observableId: string, source: Observa
   // _immutableStatus reference, which is the same object across all components
   // using the same observableId.
   if (!observable.hasValue && hasData) {
-    const initialDataValue = config?.initialData ?? config?.startWithValue;
+    const initialDataValue = config?.initialData;
 
     // In suspense mode, throw errors so React Error Boundaries can catch them.
     // In non-suspense mode, surface errors via status so consumers can handle them locally.
