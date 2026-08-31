@@ -44,11 +44,21 @@ function source<S, V>(
   };
 }
 
-export function useFirestoreCollection(key: string, q: Query, options: Options<Row[]> = {}): Result<Row[]> {
-  const { cache = 'liveServer', suspense = false, initialData } = options;
-  return useStoreValue<Row[]>(
+export function useFirestoreCollection<T = Row[]>(
+  key: string,
+  q: Query,
+  options: Options<T> & { map?: (snap: QuerySnapshot) => T } = {},
+): Result<T> {
+  const { cache = 'liveServer', suspense = false, initialData, map } = options;
+  // Default projection is the plain row shape, which is what every caller that
+  // does not care about field types wants.
+  // NOTE: `map` is deliberately not a dependency of anything. The registry keys
+  // on `key` alone, and a projector defined inline in a component body is a new
+  // function on every render.
+  const project = (map ?? (rows as unknown as (snap: QuerySnapshot) => T)) as (snap: QuerySnapshot) => T;
+  return useStoreValue<T>(
     key,
-    source(q, cache, rows, (r, obs) => onSnapshot(r, obs), (r, fromServer) => (fromServer ? getDocsFromServer(r) : getDocs(r))),
+    source(q, cache, project, (r, obs) => onSnapshot(r, obs), (r, fromServer) => (fromServer ? getDocsFromServer(r) : getDocs(r))),
     { suspense, initialData },
   );
 }
