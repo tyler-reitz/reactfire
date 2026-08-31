@@ -1,7 +1,6 @@
 'use client';
 
-import { onSnapshot } from 'firebase/firestore';
-import { useEffect, useRef, useState } from 'react';
+import { useFirestoreCollection } from './adapter/firestore';
 import { recipeQuery, toRecipes } from './recipes';
 import type { Cuisine, Recipe } from './types';
 
@@ -10,35 +9,24 @@ export type FeedStatus = 'loading' | 'ready' | 'error';
 /**
  * Takes over from the server-rendered list: seeds with what the server already
  * fetched, then switches to a live subscription without a loading flash.
+ *
+ * The key carries the cuisine, so switching filters is a different entry rather
+ * than a resubscribe on the same one. That is what makes the previous filter's
+ * list disappear instead of lingering.
  */
 export function useRecipes(cuisine: Cuisine | 'all', initialRecipes: Recipe[]) {
-  // Which filter the current `recipes` describe. It starts as the cuisine the
-  // server rendered and moves on with every snapshot, so switching away and
-  // back still shows loading rather than the previous filter's list.
-  const loadedCuisine = useRef(cuisine);
-  const [recipes, setRecipes] = useState<Recipe[]>(initialRecipes);
-  const [status, setStatus] = useState<FeedStatus>('ready');
-  const [error, setError] = useState<Error | undefined>();
+  // Only the unfiltered query was rendered on the server, so only it can be
+  // seeded. Seeding a filtered key with the full list would show the wrong rows.
+  const { data, error } = useFirestoreCollection<Recipe[]>(`recipes:${cuisine}`, recipeQuery(cuisine), {
+    map: toRecipes,
+    initialData: cuisine === 'all' ? initialRecipes : undefined,
+  });
 
-  useEffect(() => {
-    if (cuisine !== loadedCuisine.current) {
-      setStatus('loading');
-    }
+  const status: FeedStatus = error ? 'error' : data ? 'ready' : 'loading';
 
-    return onSnapshot(
-      recipeQuery(cuisine),
-      (snapshot) => {
-        setRecipes(toRecipes(snapshot));
-        loadedCuisine.current = cuisine;
-        setStatus('ready');
-        setError(undefined);
-      },
-      (err) => {
-        setError(err);
-        setStatus('error');
-      },
-    );
-  }, [cuisine]);
-
-  return { recipes, status, error };
+  return {
+    recipes: data ?? [],
+    status,
+    error: error as Error | undefined,
+  };
 }
