@@ -17,7 +17,7 @@ import {
 import { useStoreValue, type Source, type Result } from './registry';
 
 export type CacheMode = 'liveServer' | 'oneServer' | 'oneCache';
-export type Options = { cache?: CacheMode; suspense?: boolean };
+export type Options<T = unknown> = { cache?: CacheMode; suspense?: boolean; initialData?: T };
 
 type Row = Record<string, unknown> & { id: string };
 
@@ -44,20 +44,20 @@ function source<S, V>(
   };
 }
 
-export function useFirestoreCollection(key: string, q: Query, options: Options = {}): Result<Row[]> {
-  const { cache = 'liveServer', suspense = false } = options;
+export function useFirestoreCollection(key: string, q: Query, options: Options<Row[]> = {}): Result<Row[]> {
+  const { cache = 'liveServer', suspense = false, initialData } = options;
   return useStoreValue<Row[]>(
     key,
     source(q, cache, rows, (r, obs) => onSnapshot(r, obs), (r, fromServer) => (fromServer ? getDocsFromServer(r) : getDocs(r))),
-    suspense,
+    { suspense, initialData },
   );
 }
 
-export function useFirestoreDoc(key: string, ref: DocumentReference, options: Options = {}): Result<Row | undefined> {
-  const { cache = 'liveServer', suspense = false } = options;
+export function useFirestoreDoc(key: string, ref: DocumentReference, options: Options<Row | undefined> = {}): Result<Row | undefined> {
+  const { cache = 'liveServer', suspense = false, initialData } = options;
   return useStoreValue<Row | undefined>(
     key,
     source(ref, cache, row, (r, obs) => onSnapshot(r, obs), (r, fromServer) => (fromServer ? getDocFromServer(r) : getDoc(r))),
-    suspense,
+    { suspense, initialData },
   );
 }

@@ -35,7 +35,7 @@ const tokenSource = (auth: Auth): Source<TokenState> => (onData, onError) =>
   );
 
 export function useUser(auth: Auth, options: AuthOptions = {}): Result<User | null> {
-  return useStoreValue<User | null>(`auth:user:${auth.app.name}`, userSource(auth), options.suspense ?? false);
+  return useStoreValue<User | null>(`auth:user:${auth.app.name}`, userSource(auth), { suspense: options.suspense ?? false });
 }
 
 export type SigninCheckResult = { signedIn: boolean; user: User | null; hasRequiredClaims: boolean };
@@ -47,7 +47,9 @@ export function useSigninCheck(
     validateCustomClaims?: (claims: IdTokenResult['claims']) => boolean;
   } = {},
 ): Result<SigninCheckResult> {
-  const { data, error } = useStoreValue<TokenState>(`auth:token:${auth.app.name}`, tokenSource(auth), options.suspense ?? false);
+  const { data, error } = useStoreValue<TokenState>(`auth:token:${auth.app.name}`, tokenSource(auth), {
+    suspense: options.suspense ?? false,
+  });
   if (!data) return { data: undefined, error };
 
   const { user, token } = data;

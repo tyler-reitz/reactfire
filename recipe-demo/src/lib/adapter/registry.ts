@@ -59,6 +59,20 @@ function settleFirst<T>(key: string, data: T | undefined, error?: unknown) {
   record.settle();
 }
 
+/**
+ * Seed a key's first-value record from data fetched elsewhere, typically a
+ * server render. A no-op once the record has settled, so a remount or a second
+ * consumer cannot overwrite live data with stale server rows.
+ */
+export function seedFirst<T>(key: string, data: T) {
+  const record = firstRecord<T>(key);
+  if (record.settled) return;
+  record.data = data;
+  record.settled = true;
+  record.error = undefined;
+  record.settle();
+}
+
 function teardown(key: string) {
   const e = entries.get(key);
   if (!e) return;
@@ -114,7 +128,17 @@ export type Result<T> = { data: T | undefined; error: unknown };
  * The one hook every binding is built from. `suspense` and non-suspense read
  * the SAME store: there is no second implementation for the suspense cohort.
  */
-export function useStoreValue<T>(key: string, source: Source<T>, suspense = false): Result<T> {
+export function useStoreValue<T>(
+  key: string,
+  source: Source<T>,
+  options: { suspense?: boolean; initialData?: T } = {},
+): Result<T> {
+  const { suspense = false, initialData } = options;
+  // Seeding during render is deliberate and safe: seedFirst is idempotent and
+  // a no-op once settled, and the value has to be present BEFORE the suspense
+  // check below or a seeded query would suspend anyway.
+  if (initialData !== undefined) seedFirst(key, initialData);
+
   useEffect(() => {
     ensure(key, source).count++;
     return () => release(key);
