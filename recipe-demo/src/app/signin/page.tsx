@@ -3,27 +3,24 @@
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense, useState } from 'react';
 import { safeNext } from '@/lib/safe-next';
-import { signIn } from '@/lib/session';
+import { useSignIn } from '@/lib/mutations';
 
 function SignInForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [error, setError] = useState<string | undefined>();
-  const [pending, setPending] = useState(false);
+  const signInMutation = useSignIn();
+  const error = signInMutation.error?.message;
+  const pending = signInMutation.isPending;
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
-    setPending(true);
-    setError(undefined);
     try {
-      await signIn(email, password);
+      await signInMutation.mutateAsync({ email, password });
       router.replace(safeNext(searchParams.get('next'), window.location.origin));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setPending(false);
+    } catch {
+      // the mutation holds the error; nothing to do here
     }
   }
 

@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import '@picocss/pico/css/pico.min.css';
+import { QueryProvider } from '@/lib/query-client';
 import { SessionProvider } from '@/lib/session-context';
 import { SessionNav } from '@/components/SessionNav';
 
@@ -13,7 +14,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body>
-        <SessionProvider>
+        <QueryProvider>
+          <SessionProvider>
           <header className="container">
             <nav>
               <ul>
@@ -32,7 +34,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             </nav>
           </header>
           <main className="container">{children}</main>
-        </SessionProvider>
+          </SessionProvider>
+        </QueryProvider>
       </body>
     </html>
   );
