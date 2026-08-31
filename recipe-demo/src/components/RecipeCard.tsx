@@ -1,23 +1,20 @@
 'use client';
 
-import { useState } from 'react';
-import { toggleLike } from '@/lib/recipes';
+import { useToggleLike } from '@/lib/mutations';
 import { useSession } from '@/lib/session-context';
 import type { Recipe } from '@/lib/types';
 
 export function RecipeCard({ recipe }: { recipe: Recipe }) {
   const { user } = useSession();
-  const [pending, setPending] = useState(false);
   const liked = user ? recipe.likedBy.includes(user.uid) : false;
+  const likeMutation = useToggleLike();
+  const pending = likeMutation.isPending;
 
-  async function onToggleLike() {
+  function onToggleLike() {
     if (!user) return;
-    setPending(true);
-    try {
-      await toggleLike(recipe.id, user.uid, liked);
-    } finally {
-      setPending(false);
-    }
+    // No invalidation on success: the recipes view is a subscription and the
+    // write arrives back through the listener.
+    likeMutation.mutate({ recipeId: recipe.id, uid: user.uid, liked });
   }
 
   return (

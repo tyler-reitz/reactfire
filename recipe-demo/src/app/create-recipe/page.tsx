@@ -4,31 +4,20 @@ import Link from 'next/link';
 import { useState } from 'react';
 import { Suspense } from 'react';
 import { RequireAuthSuspense } from '@/components/RequireAuthSuspense';
-import { generateRecipe } from '@/lib/ai';
-import { createRecipe } from '@/lib/recipes';
-import { CUISINES, type Cuisine, type RecipeDraft } from '@/lib/types';
+import { useGenerateAndSaveRecipe } from '@/lib/mutations';
+import { CUISINES, type Cuisine } from '@/lib/types';
 
 function CreateRecipe() {
   const [cuisine, setCuisine] = useState<Cuisine>(CUISINES[0]);
-  const [draft, setDraft] = useState<RecipeDraft | undefined>();
-  const [error, setError] = useState<string | undefined>();
-  const [pending, setPending] = useState(false);
+  const generateMutation = useGenerateAndSaveRecipe();
+  const draft = generateMutation.data;
+  // Surfaced verbatim on purpose: when AI Logic is not enabled, or the billing
+  // account has lapsed, the raw message is the whole diagnosis.
+  const error = generateMutation.error?.message;
+  const pending = generateMutation.isPending;
 
-  async function onGenerate() {
-    setPending(true);
-    setError(undefined);
-    setDraft(undefined);
-    try {
-      const generated = await generateRecipe(cuisine);
-      await createRecipe(generated);
-      setDraft(generated);
-    } catch (err) {
-      // Surfaced verbatim on purpose: when AI Logic is not enabled, or the
-      // billing account has lapsed, the raw message is the whole diagnosis.
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setPending(false);
-    }
+  function onGenerate() {
+    generateMutation.mutate(cuisine);
   }
 
   return (

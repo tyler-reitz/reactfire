@@ -1,11 +1,12 @@
 'use client';
 
 import Link from 'next/link';
-import { logOut } from '@/lib/session';
+import { useSignOut } from '@/lib/mutations';
 import { useSession } from '@/lib/session-context';
 
 export function SessionNav() {
   const { user, status } = useSession();
+  const signOutMutation = useSignOut();
 
   if (status === 'loading') {
     return (
@@ -29,7 +30,7 @@ export function SessionNav() {
     <>
       <li>{user.email}</li>
       <li>
-        <button className="secondary" onClick={() => logOut()}>
+        <button className="secondary" onClick={() => signOutMutation.mutate()} disabled={signOutMutation.isPending}>
           Sign out
         </button>
       </li>
