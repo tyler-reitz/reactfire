@@ -2,7 +2,8 @@
 
 import Link from 'next/link';
 import { useState } from 'react';
-import { RequireAuth } from '@/components/RequireAuth';
+import { Suspense } from 'react';
+import { RequireAuthSuspense } from '@/components/RequireAuthSuspense';
 import { generateRecipe } from '@/lib/ai';
 import { createRecipe } from '@/lib/recipes';
 import { CUISINES, type Cuisine, type RecipeDraft } from '@/lib/types';
@@ -67,8 +68,10 @@ function CreateRecipe() {
 
 export default function CreateRecipePage() {
   return (
-    <RequireAuth>
-      <CreateRecipe />
-    </RequireAuth>
+    <Suspense fallback={<article aria-busy="true">Checking your session</article>}>
+      <RequireAuthSuspense>
+        <CreateRecipe />
+      </RequireAuthSuspense>
+    </Suspense>
   );
 }
